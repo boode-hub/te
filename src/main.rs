@@ -4,7 +4,7 @@ mod editor;
 mod search;
 mod tools;
 
-use editor::{Editor, View};
+use editor::{Editor, Theme, View};
 use eframe::egui::{self, Align2, Color32, FontFamily, FontId, Frame, Key, Modifiers, Rect, RichText, Sense, TextEdit, Vec2, pos2, vec2};
 use eframe::egui_wgpu;
 use search::{Query, Search, Target};
@@ -29,12 +29,15 @@ const RECENT_MAX: usize = 12;
 /// Itachi's Mangekyou Sharingan, rendered from assets/logo/itachi.svg by build.rs (128x128 RGBA).
 const LOGO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo_128.rgba"));
 
+fn preset(i: usize) -> Theme {
+    Theme::from_pair(Color32::from_hex(THEMES[i].1).unwrap(), Color32::from_hex(THEMES[i].2).unwrap())
+}
+
 struct Settings {
     font: String,
     font_path: String,
     size: f32,
-    bg: Color32,
-    fg: Color32,
+    t: Theme,
     gutter: bool,
     spacing: f32,
     recent: Vec<String>,
@@ -46,50 +49,128 @@ impl Settings {
         std::env::current_exe().unwrap_or_default().with_file_name("te.cfg")
     }
 
-    fn load() -> Settings {
-        let mut s = Settings {
+    fn default() -> Settings {
+        Settings {
             font: "Built-in mono".into(),
             font_path: String::new(),
             size: 15.0,
-            bg: Color32::from_hex(THEMES[0].1).unwrap(),
-            fg: Color32::from_hex(THEMES[0].2).unwrap(),
+            t: preset(0),
             gutter: true,
             spacing: 1.25,
             recent: Vec::new(),
-        };
-        for line in std::fs::read_to_string(Self::path()).unwrap_or_default().lines() {
-            let Some((k, v)) = line.split_once('=') else { continue };
-            match k {
-                "font" => s.font = v.into(),
-                "font_path" => s.font_path = v.into(),
-                "size" => s.size = v.parse().unwrap_or(s.size),
-                "bg" => s.bg = Color32::from_hex(v).unwrap_or(s.bg),
-                "fg" => s.fg = Color32::from_hex(v).unwrap_or(s.fg),
-                "gutter" => s.gutter = v == "1",
-                "spacing" => s.spacing = v.parse().unwrap_or(s.spacing),
-                "recent" if s.recent.len() < RECENT_MAX => s.recent.push(v.into()),
-                _ => {}
-            }
         }
+    }
+
+    fn load() -> Settings {
+        let mut s = Settings::default();
+        s.apply(&std::fs::read_to_string(Self::path()).unwrap_or_default());
         s
     }
 
-    fn serialize(&self) -> String {
+    /// Applies `key=value` lines (te.cfg or a saved profile). Colours missing from older files
+    /// are derived from the background and text colours.
+    fn apply(&mut self, text: &str) {
+        let (mut colors, mut recent) = (HashMap::new(), Vec::new());
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            match k {
+                "font" => self.font = v.into(),
+                "font_path" => self.font_path = v.into(),
+                "size" => self.size = v.parse().unwrap_or(self.size),
+                "gutter" => self.gutter = v == "1",
+                "spacing" => self.spacing = v.parse().unwrap_or(self.spacing),
+                "recent" if recent.len() < RECENT_MAX => recent.push(v.to_string()),
+                k => {
+                    if let Ok(c) = Color32::from_hex(v) {
+                        colors.insert(k.to_string(), c);
+                    }
+                }
+            }
+        }
+        if colors.contains_key("bg") || colors.contains_key("fg") {
+            self.t = Theme::from_pair(*colors.get("bg").unwrap_or(&self.t.bg), *colors.get("fg").unwrap_or(&self.t.fg));
+        }
+        for (_, key, c) in self.t.slots() {
+            if let Some(v) = colors.get(key) {
+                *c = *v;
+            }
+        }
+        if !recent.is_empty() {
+            self.recent = recent;
+        }
+    }
+
+    /// Everything a profile holds: font, sizes and every colour (not the recent-files list).
+    fn style(&self) -> String {
         let mut out = format!(
-            "font={}\nfont_path={}\nsize={}\nbg={}\nfg={}\ngutter={}\nspacing={}\n",
-            self.font,
-            self.font_path,
-            self.size,
-            self.bg.to_hex(),
-            self.fg.to_hex(),
-            self.gutter as u8,
-            self.spacing
+            "font={}\nfont_path={}\nsize={}\ngutter={}\nspacing={}\n",
+            self.font, self.font_path, self.size, self.gutter as u8, self.spacing
         );
+        let mut t = self.t;
+        for (_, key, c) in t.slots() {
+            out += &format!("{key}={}\n", c.to_hex());
+        }
+        out
+    }
+
+    fn serialize(&self) -> String {
+        let mut out = self.style();
         for r in &self.recent {
             out += &format!("recent={r}\n");
         }
         out
     }
+}
+
+/// Saved appearance profiles, one `<name>.cfg` each, next to the exe.
+fn profiles_dir() -> PathBuf {
+    std::env::current_exe().unwrap_or_default().with_file_name("profiles")
+}
+
+fn list_profiles() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(profiles_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".cfg").map(String::from))
+        .collect();
+    v.sort_by_key(|n| n.to_lowercase());
+    v
+}
+
+/// The palette: 24 hues × 10 shades plus a row of greys (264 colours).
+fn palette() -> Vec<Color32> {
+    const SHADES: [(f32, f32); 10] = [(0.15, 1.0), (0.3, 1.0), (0.5, 1.0), (0.75, 1.0), (1.0, 1.0), (1.0, 0.82), (1.0, 0.64), (1.0, 0.46), (0.9, 0.3), (0.7, 0.16)];
+    let mut out = Vec::with_capacity(264);
+    for (s, v) in SHADES {
+        out.extend((0..24).map(|h| Color32::from(egui::ecolor::Hsva::new(h as f32 / 24.0, s, v, 1.0))));
+    }
+    out.extend((0..24).map(|i| {
+        let g = (255.0 * (1.0 - i as f32 / 23.0)) as u8;
+        Color32::from_rgb(g, g, g)
+    }));
+    out
+}
+
+/// Where the mouse is in this window right now, asked of Windows directly: winit reports
+/// dropped files without a position, and the pointer isn't tracked during a drag.
+fn os_cursor(ctx: &egui::Context) -> Option<egui::Pos2> {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetCursorPos(p: *mut Point) -> i32;
+    }
+    let mut p = Point { x: 0, y: 0 };
+    // SAFETY: GetCursorPos only writes the POINT we pass.
+    if unsafe { GetCursorPos(&mut p) } == 0 {
+        return None;
+    }
+    let (rect, ppp) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().native_pixels_per_point.unwrap_or(1.0)));
+    Some(pos2(p.x as f32 / ppp, p.y as f32 / ppp) - rect?.min.to_vec2())
 }
 
 /// Fonts compiled into the exe (all SIL OFL / Apache, licenses in assets/fonts): (group, name, bytes).
@@ -240,6 +321,15 @@ fn pane_rects(r: Rect, n: usize) -> Vec<Rect> {
     (0..n).map(|i| Rect::from_min_size(pos2(r.left() + w * i as f32, r.top()), vec2(w, r.height()))).collect()
 }
 
+fn pane_name(n: usize, p: usize) -> &'static str {
+    match n {
+        2 => ["Left pane", "Right pane"][p],
+        3 => ["Left pane", "Middle pane", "Right pane"][p],
+        4 => ["Top-left pane", "Top-right pane", "Bottom-left pane", "Bottom-right pane"][p],
+        _ => "This pane",
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Scope {
     File,
@@ -271,7 +361,14 @@ struct App {
     font_filter: String,
     s: Settings,
     saved_cfg: String,
-    visuals_for: (Color32, Color32),
+    visuals_for: Option<Theme>,
+    /// Last frame's pane rectangles, to find which pane a file was dropped on.
+    pane_rects: Vec<Rect>,
+    look_tab: usize,
+    paint_slot: usize,
+    palette: Vec<Color32>,
+    profiles: Option<Vec<String>>,
+    profile_name: String,
     status: String,
     title: String,
     logo: egui::TextureHandle,
@@ -310,7 +407,13 @@ impl App {
             font_filter: String::new(),
             saved_cfg: s.serialize(),
             s,
-            visuals_for: (Color32::TRANSPARENT, Color32::TRANSPARENT),
+            visuals_for: None,
+            pane_rects: Vec::new(),
+            look_tab: 0,
+            paint_slot: 0,
+            palette: palette(),
+            profiles: None,
+            profile_name: String::new(),
             status: String::new(),
             title: String::new(),
             logo,
@@ -353,7 +456,7 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let cur = self.cur();
-        if self.tabs[cur].is_pristine() {
+        if self.tabs[cur].is_pristine() && self.panes.iter().filter(|&&p| p == cur).count() == 1 {
             self.tabs[cur] = Editor::open(id, p);
         } else {
             self.tabs.push(Editor::open(id, p));
@@ -381,8 +484,16 @@ impl App {
 
     fn set_layout(&mut self, n: usize) {
         while self.panes.len() < n {
-            // Fill new panes with tabs not on screen yet, if there are any.
-            let next = (0..self.tabs.len()).find(|t| !self.panes.contains(t)).unwrap_or(self.cur());
+            // Fill new panes with tabs not on screen yet, else a fresh empty tab, so one file
+            // never lands in two panes unless you put it there.
+            let next = match (0..self.tabs.len()).find(|t| !self.panes.contains(t)) {
+                Some(t) => t,
+                None => {
+                    self.tabs.push(Editor::new(self.next_id));
+                    self.next_id += 1;
+                    self.tabs.len() - 1
+                }
+            };
             self.panes.push(next);
         }
         self.panes.truncate(n);
@@ -730,8 +841,7 @@ impl App {
                 ui.menu_button("Theme", |ui| {
                     for (name, bg, fg) in THEMES {
                         if ui.button(*name).clicked() {
-                            self.s.bg = Color32::from_hex(bg).unwrap();
-                            self.s.fg = Color32::from_hex(fg).unwrap();
+                            self.s.t = Theme::from_pair(Color32::from_hex(bg).unwrap(), Color32::from_hex(fg).unwrap());
                         }
                     }
                 });
@@ -793,8 +903,8 @@ impl App {
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        let (fg, cur) = (self.s.fg, self.cur());
-        let (mut show, mut close, mut add) = (None, None, false);
+        let (fg, cur) = (self.s.t.fg, self.cur());
+        let (mut show, mut close, mut add, mut to_pane) = (None, None, false, None);
         egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
@@ -810,6 +920,16 @@ impl App {
                     if r.middle_clicked() {
                         close = Some(i);
                     }
+                    if self.panes.len() > 1 {
+                        r.context_menu(|ui| {
+                            ui.weak("Show in");
+                            for p in 0..self.panes.len() {
+                                if ui.button(pane_name(self.panes.len(), p)).clicked() {
+                                    to_pane = Some((i, p));
+                                }
+                            }
+                        });
+                    }
                     if ui.add(egui::Button::new(RichText::new("×").size(13.0).color(fg.gamma_multiply(0.4))).frame(false)).clicked() {
                         close = Some(i);
                     }
@@ -822,6 +942,10 @@ impl App {
         });
         if let Some(i) = show {
             self.show_tab(i);
+        }
+        if let Some((i, p)) = to_pane {
+            self.panes[p] = i;
+            self.active = p;
         }
         if let Some(i) = close {
             self.close_tab(i);
@@ -902,7 +1026,7 @@ impl App {
             ui.weak("No search yet. Ctrl+Shift+F searches open tabs or the open folder.");
             return;
         };
-        let fg = self.s.fg;
+        let fg = self.s.t.fg;
         let mut clicked = None;
         let mut close = false;
         {
@@ -938,7 +1062,7 @@ impl App {
                             let mono = |c: Color32| egui::TextFormat { font_id: FontId::monospace(12.5), color: c, ..Default::default() };
                             job.append(&format!("{:>8}  ", hit.line + 1), 0.0, mono(fg.gamma_multiply(0.4)));
                             job.append(&hit.preview[0], 0.0, mono(fg.gamma_multiply(0.75)));
-                            job.append(&hit.preview[1], 0.0, egui::TextFormat { background: fg.gamma_multiply(0.25), ..mono(fg) });
+                            job.append(&hit.preview[1], 0.0, egui::TextFormat { background: self.s.t.matches, ..mono(fg) });
                             job.append(&hit.preview[2], 0.0, mono(fg.gamma_multiply(0.75)));
                             if ui.add(egui::Label::new(job).truncate().sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                 clicked = Some((fh.target.clone(), hit.range.clone()));
@@ -1031,7 +1155,7 @@ impl App {
     }
 
     fn panes(&mut self, ui: &mut egui::Ui) {
-        let fg = self.s.fg;
+        let (fg, theme) = (self.s.t.fg, self.s.t);
         let hl = if self.find_open && !self.query.text.is_empty() {
             if self.highlight.as_ref().is_none_or(|(q, _)| q.text != self.query.text || q.case != self.query.case || q.word != self.query.word || q.regex != self.query.regex) {
                 self.highlight = self.query.build().ok().map(|re| (self.query.clone(), re));
@@ -1040,9 +1164,15 @@ impl App {
         } else {
             None
         };
-        let view = View { font: FontId::new(self.s.size, FontFamily::Name("user".into())), fg, gutter: self.s.gutter, spacing: self.s.spacing, highlight: hl.as_ref() };
+        let view = View { font: FontId::new(self.s.size, FontFamily::Name("user".into())), theme, gutter: self.s.gutter, spacing: self.s.spacing, highlight: hl.as_ref() };
         let n = self.panes.len();
         let rects = pane_rects(ui.max_rect(), n);
+        self.pane_rects = rects.clone();
+        let dragging = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        let drop_pane = if dragging && n > 1 { os_cursor(ui.ctx()).and_then(|c| rects.iter().position(|r| r.contains(c))) } else { None };
+        if dragging {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
+        }
         for (p, r) in rects.into_iter().enumerate() {
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r.shrink(if n > 1 { 1.0 } else { 0.0 })).id_salt(("pane", p)));
             let tab = self.panes[p];
@@ -1063,11 +1193,16 @@ impl App {
             if n > 1 {
                 ui.painter().rect_stroke(r, 0.0, (1.0, fg.gamma_multiply(0.12)), egui::StrokeKind::Inside);
             }
+            if drop_pane == Some(p) {
+                ui.painter().rect_filled(r.shrink(2.0), 6.0, theme.selection);
+                ui.painter().rect_stroke(r.shrink(2.0), 6.0, (2.0, fg), egui::StrokeKind::Inside);
+                ui.painter().text(r.center(), Align2::CENTER_CENTER, format!("Drop into {}", pane_name(n, p).to_lowercase()), FontId::proportional(18.0), fg);
+            }
         }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let fg = self.s.fg;
+        let fg = self.s.t.fg;
         ui.horizontal_centered(|ui| {
             let dim = |t: String| RichText::new(t).size(12.0).color(fg.gamma_multiply(0.55));
             let e = &self.tabs[self.cur()];
@@ -1090,86 +1225,204 @@ impl App {
         let mut open = self.settings_open;
         egui::Window::new("Appearance").open(&mut open).collapsible(false).resizable(false).anchor(Align2::RIGHT_TOP, [-16.0, 70.0]).show(ctx, |ui| {
             ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-            ui.horizontal_wrapped(|ui| {
-                for (name, bg, fg) in THEMES {
-                    let (bg, fg) = (Color32::from_hex(bg).unwrap(), Color32::from_hex(fg).unwrap());
-                    let b = egui::Button::new(RichText::new(*name).color(fg).size(12.0)).fill(bg).corner_radius(6);
-                    if ui.add(b).clicked() {
-                        self.s.bg = bg;
-                        self.s.fg = fg;
-                    }
-                }
-            });
-            ui.separator();
-            egui::Grid::new("colors").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                ui.label("Background");
-                ui.color_edit_button_srgba(&mut self.s.bg);
-                ui.end_row();
-                ui.label("Text");
-                ui.color_edit_button_srgba(&mut self.s.fg);
-                ui.end_row();
-                ui.label("Size");
-                ui.add(egui::Slider::new(&mut self.s.size, 6.0..=96.0).step_by(0.5));
-                ui.end_row();
-                ui.label("Line spacing");
-                ui.add(egui::Slider::new(&mut self.s.spacing, 1.0..=2.5).step_by(0.05));
-                ui.end_row();
-                ui.label("Line numbers");
-                ui.checkbox(&mut self.s.gutter, "");
-                ui.end_row();
-            });
-            ui.separator();
-            ui.label(format!("Font — {}", self.s.font));
-            if self.fonts.is_empty() {
-                self.fonts = all_fonts();
-            }
             ui.horizontal(|ui| {
-                ui.add(TextEdit::singleline(&mut self.font_filter).hint_text("Search fonts…").desired_width(180.0));
-                if ui.small_button("Fonts folder").on_hover_text("Drop .ttf / .otf files here, then Refresh").clicked() {
-                    let dir = user_fonts_dir();
-                    let _ = std::fs::create_dir_all(&dir);
-                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                for (i, name) in ["Colours", "Font & size", "Profiles"].into_iter().enumerate() {
+                    ui.selectable_value(&mut self.look_tab, i, name);
                 }
-                if ui.small_button("Refresh").clicked() {
-                    self.fonts.clear();
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Reset to defaults").on_hover_text("Default colours, font and sizes (recent files are kept)").clicked() {
+                        let recent = std::mem::take(&mut self.s.recent);
+                        self.s = Settings::default();
+                        self.s.recent = recent;
+                        apply_font(ctx, "");
+                        self.status = "Appearance reset to defaults".into();
+                    }
+                });
             });
-            let filter = self.font_filter.to_lowercase();
-            let mut pick = None;
-            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                let mut group = "";
-                for (g, name, path) in self.fonts.iter().filter(|f| f.1.to_lowercase().contains(&filter)) {
-                    if *g != group {
-                        group = g;
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(*g).size(11.0).color(self.s.fg.gamma_multiply(0.45)));
-                    }
-                    let mut text = RichText::new(name);
-                    if path.starts_with("bundled:") {
-                        text = text.family(FontFamily::Name(name.as_str().into())).size(16.0);
-                    }
-                    if ui.selectable_label(*name == self.s.font, text).clicked() {
-                        pick = Some((name.clone(), path.clone()));
-                    }
-                }
-            });
-            if let Some((name, path)) = pick {
-                if !apply_font(ctx, &path) {
-                    self.status = format!("Can't read font \"{name}\", using built-in");
-                }
-                self.s.font = name;
-                self.s.font_path = path;
+            ui.separator();
+            match self.look_tab {
+                0 => self.colours_tab(ui),
+                1 => self.font_tab(ui, ctx),
+                _ => self.profiles_tab(ui, ctx),
             }
         });
         self.settings_open = open;
     }
 
+    fn colours_tab(&mut self, ui: &mut egui::Ui) {
+        let dim = self.s.t.fg.gamma_multiply(0.5);
+        ui.label(RichText::new("Presets").size(11.0).color(dim));
+        ui.horizontal_wrapped(|ui| {
+            for (name, bg, fg) in THEMES {
+                let (bg, fg) = (Color32::from_hex(bg).unwrap(), Color32::from_hex(fg).unwrap());
+                let b = egui::Button::new(RichText::new(*name).color(fg).size(12.0)).fill(bg).corner_radius(6);
+                if ui.add(b).clicked() {
+                    self.s.t = Theme::from_pair(bg, fg);
+                }
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(RichText::new("Your theme: pick a part, then click a colour below. The swatch next to each part opens an exact colour picker.").size(11.0).color(dim));
+        let mut paint = self.paint_slot;
+        egui::Grid::new("slots").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
+            for (i, (label, _, c)) in self.s.t.slots().into_iter().enumerate() {
+                ui.color_edit_button_srgba(c);
+                if ui.selectable_label(paint == i, label).clicked() {
+                    paint = i;
+                }
+                if i % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+        self.paint_slot = paint;
+        ui.add_space(4.0);
+        let fg = self.s.t.fg;
+        let mut picked = None;
+        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+        for row in self.palette.chunks(24) {
+            ui.horizontal(|ui| {
+                for &c in row {
+                    let (r, resp) = ui.allocate_exact_size(vec2(19.0, 19.0), Sense::click());
+                    ui.painter().rect_filled(r, 3.0, c);
+                    if resp.hovered() {
+                        ui.painter().rect_stroke(r.expand(1.0), 3.0, (2.0, fg), egui::StrokeKind::Outside);
+                    }
+                    if resp.on_hover_text(c.to_hex()).clicked() {
+                        picked = Some(c);
+                    }
+                }
+            });
+        }
+        if let Some(c) = picked
+            && let Some((_, _, target)) = self.s.t.slots().into_iter().nth(self.paint_slot)
+        {
+            // Translucent parts (selection, current line, matches) keep their transparency.
+            *target = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), target.a());
+        }
+    }
+
+    fn font_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::Grid::new("sizes").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+            ui.label("Size");
+            ui.add(egui::Slider::new(&mut self.s.size, 6.0..=96.0).step_by(0.5));
+            ui.end_row();
+            ui.label("Line spacing");
+            ui.add(egui::Slider::new(&mut self.s.spacing, 1.0..=2.5).step_by(0.05));
+            ui.end_row();
+            ui.label("Line numbers");
+            ui.checkbox(&mut self.s.gutter, "");
+            ui.end_row();
+        });
+        ui.separator();
+        ui.label(format!("Font — {}", self.s.font));
+        if self.fonts.is_empty() {
+            self.fonts = all_fonts();
+        }
+        ui.horizontal(|ui| {
+            ui.add(TextEdit::singleline(&mut self.font_filter).hint_text("Search fonts…").desired_width(180.0));
+            if ui.small_button("Fonts folder").on_hover_text("Drop .ttf / .otf files here, then Refresh").clicked() {
+                let dir = user_fonts_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::process::Command::new("explorer").arg(dir).spawn();
+            }
+            if ui.small_button("Refresh").clicked() {
+                self.fonts.clear();
+            }
+        });
+        let filter = self.font_filter.to_lowercase();
+        let mut pick = None;
+        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            let mut group = "";
+            for (g, name, path) in self.fonts.iter().filter(|f| f.1.to_lowercase().contains(&filter)) {
+                if *g != group {
+                    group = g;
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(*g).size(11.0).color(self.s.t.fg.gamma_multiply(0.45)));
+                }
+                let mut text = RichText::new(name);
+                if path.starts_with("bundled:") {
+                    text = text.family(FontFamily::Name(name.as_str().into())).size(16.0);
+                }
+                if ui.selectable_label(*name == self.s.font, text).clicked() {
+                    pick = Some((name.clone(), path.clone()));
+                }
+            }
+        });
+        if let Some((name, path)) = pick {
+            if !apply_font(ctx, &path) {
+                self.status = format!("Can't read font \"{name}\", using built-in");
+            }
+            self.s.font = name;
+            self.s.font_path = path;
+        }
+    }
+
+    fn profiles_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(RichText::new("Save the current colours, font and sizes under a name, and load them back any time. Profiles are files in the profiles folder next to te.exe, so they travel with it.").size(11.0).color(self.s.t.fg.gamma_multiply(0.5)));
+        ui.horizontal(|ui| {
+            let r = ui.add(TextEdit::singleline(&mut self.profile_name).hint_text("Profile name").desired_width(220.0));
+            let name: String = self.profile_name.trim().chars().filter(|c| c.is_alphanumeric() || " -_".contains(*c)).collect();
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if (ui.add_enabled(!name.is_empty(), egui::Button::new("Save")).clicked() || enter) && !name.is_empty() {
+                let _ = std::fs::create_dir_all(profiles_dir());
+                self.status = match std::fs::write(profiles_dir().join(format!("{name}.cfg")), self.s.style()) {
+                    Ok(()) => format!("Profile \"{name}\" saved"),
+                    Err(e) => format!("Couldn't save profile: {e}"),
+                };
+                self.profiles = None;
+            }
+        });
+        let list = self.profiles.get_or_insert_with(list_profiles).clone();
+        if list.is_empty() {
+            ui.weak("No saved profiles yet");
+        }
+        let (mut load, mut delete) = (None, None);
+        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+            for name in &list {
+                ui.horizontal(|ui| {
+                    ui.label(name);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Delete").clicked() {
+                            delete = Some(name.clone());
+                        }
+                        if ui.small_button("Load").clicked() {
+                            load = Some(name.clone());
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(name) = load {
+            match std::fs::read_to_string(profiles_dir().join(format!("{name}.cfg"))) {
+                Ok(text) => {
+                    self.s.apply(&text);
+                    self.status = if apply_font(ctx, &self.s.font_path) { format!("Profile \"{name}\" loaded") } else { format!("Profile \"{name}\" loaded, but its font is missing; using built-in") };
+                    self.profile_name = name;
+                }
+                Err(e) => self.status = format!("Couldn't load profile: {e}"),
+            }
+        }
+        if let Some(name) = delete {
+            let sure = rfd::MessageDialog::new()
+                .set_title("te")
+                .set_description(format!("Delete the profile \"{name}\"?"))
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+            if sure == rfd::MessageDialogResult::Yes {
+                let _ = std::fs::remove_file(profiles_dir().join(format!("{name}.cfg")));
+                self.profiles = None;
+            }
+        }
+    }
+
     fn sync_visuals(&mut self, ctx: &egui::Context) {
-        let (bg, fg) = (self.s.bg, self.s.fg);
-        if self.visuals_for == (bg, fg) {
+        let t = self.s.t;
+        if self.visuals_for == Some(t) {
             return;
         }
-        self.visuals_for = (bg, fg);
+        self.visuals_for = Some(t);
+        let (bg, fg) = (t.bars, t.fg);
         let dark = (0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32) < 128.0;
         let lift = |t: f32| {
             let to = if dark { 255.0 } else { 0.0 };
@@ -1183,7 +1436,7 @@ impl App {
         v.faint_bg_color = lift(0.04);
         v.override_text_color = Some(fg);
         v.window_stroke = egui::Stroke::new(1.0, lift(0.15));
-        v.selection.bg_fill = fg.gamma_multiply(0.3);
+        v.selection.bg_fill = t.selection;
         v.widgets.inactive.weak_bg_fill = lift(0.07);
         v.widgets.hovered.weak_bg_fill = lift(0.13);
         v.widgets.active.weak_bg_fill = lift(0.18);
@@ -1216,7 +1469,13 @@ impl eframe::App for App {
                 }
             }
         }
-        for p in ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>()) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>());
+        if !dropped.is_empty()
+            && let Some(p) = os_cursor(&ctx).and_then(|c| self.pane_rects.iter().position(|r| r.contains(c)))
+        {
+            self.active = p;
+        }
+        for p in dropped {
             if p.is_dir() { self.set_folder(p) } else { self.open_path(p) }
         }
         self.shortcuts(&ctx);
@@ -1227,8 +1486,8 @@ impl eframe::App for App {
             self.title = title;
         }
 
-        let bg = self.s.bg;
-        let bar = |m: i8| Frame::NONE.fill(bg).inner_margin(egui::Margin::symmetric(m, 3));
+        let (bg, bars) = (self.s.t.bg, self.s.t.bars);
+        let bar = |m: i8| Frame::NONE.fill(bars).inner_margin(egui::Margin::symmetric(m, 3));
         egui::Panel::top("menu").frame(bar(8)).show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("tabs").frame(bar(8)).show(ui, |ui| self.tab_bar(ui));
         if self.find_open {
@@ -1280,4 +1539,32 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("te", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_profiles_and_palette() {
+        // An old te.cfg with only bg/fg gets the other colours derived from them.
+        let mut s = Settings::default();
+        s.apply("bg=#102030ff\nfg=#e0e0e0ff\nsize=18\nrecent=C:/a.txt\n");
+        let (bg, fg) = (Color32::from_hex("#102030ff").unwrap(), Color32::from_hex("#e0e0e0ff").unwrap());
+        assert!(s.t == Theme::from_pair(bg, fg) && s.size == 18.0 && s.recent == ["C:/a.txt"]);
+
+        // A profile round-trips every colour, but leaves recent files alone.
+        s.t.cursor = Color32::from_rgb(255, 0, 0);
+        s.t.selection = Color32::from_rgba_unmultiplied(0, 128, 255, 60);
+        s.font = "Orbitron".into();
+        let profile = s.style();
+        assert!(!profile.contains("recent="));
+        let mut other = Settings::default();
+        other.recent = vec!["keep".into()];
+        other.apply(&profile);
+        assert!(other.t == s.t && other.font == "Orbitron" && other.recent == ["keep"]);
+
+        assert_eq!(palette().len(), 264);
+        assert_eq!(pane_name(4, 3), "Bottom-right pane");
+    }
 }

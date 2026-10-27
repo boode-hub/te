@@ -12,10 +12,52 @@ const UNDO_LIMIT: usize = 1000;
 /// Whole-document tools (format, replace all, line ops) need the text in memory; cap it.
 pub const TRANSFORM_LIMIT: usize = 256 << 20;
 
+/// Every colour the user can map. `from_pair` derives a whole theme from background + text.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Theme {
+    pub bg: Color32,
+    pub fg: Color32,
+    pub cursor: Color32,
+    pub selection: Color32,
+    pub line: Color32,
+    pub numbers: Color32,
+    pub matches: Color32,
+    pub bars: Color32,
+}
+
+impl Theme {
+    pub fn from_pair(bg: Color32, fg: Color32) -> Theme {
+        Theme {
+            bg,
+            fg,
+            cursor: fg,
+            selection: fg.gamma_multiply(0.22),
+            line: fg.gamma_multiply(0.05),
+            numbers: fg.gamma_multiply(0.3),
+            matches: fg.gamma_multiply(0.45),
+            bars: bg,
+        }
+    }
+
+    /// (label, config key, colour) for each slot, in display order.
+    pub fn slots(&mut self) -> [(&'static str, &'static str, &mut Color32); 8] {
+        [
+            ("Background", "bg", &mut self.bg),
+            ("Text", "fg", &mut self.fg),
+            ("Cursor", "cursor", &mut self.cursor),
+            ("Selection", "selection", &mut self.selection),
+            ("Current line", "line", &mut self.line),
+            ("Line numbers", "numbers", &mut self.numbers),
+            ("Search matches", "matches", &mut self.matches),
+            ("Bars and panels", "bars", &mut self.bars),
+        ]
+    }
+}
+
 /// How to draw, shared by every pane.
 pub struct View<'a> {
     pub font: FontId,
-    pub fg: Color32,
+    pub theme: Theme,
     pub gutter: bool,
     pub spacing: f32,
     pub highlight: Option<&'a Regex>,
@@ -537,7 +579,7 @@ impl Editor {
     /// Draws into the whole of `ui`. Keyboard input is handled only when `active`.
     pub fn draw(&mut self, ui: &mut egui::Ui, v: &View, active: bool) -> egui::Response {
         let ctx = ui.ctx().clone();
-        let fg = v.fg;
+        let (fg, t) = (v.theme.fg, v.theme);
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         if let Some(l) = &self.loading {
             let p = if l.total == 0 { 0.0 } else { l.done.load(std::sync::atomic::Ordering::Relaxed) as f32 / l.total as f32 };
@@ -649,12 +691,12 @@ impl Editor {
             let span = |a: usize, z: usize| (x0 + width(&ctx, font, &b[..a]), x0 + width(&ctx, font, &b[..z]));
             if n == cur_line && active {
                 let r = Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width() - bar_w, line_h));
-                ui.painter_at(rect).rect_filled(r, 0.0, fg.gamma_multiply(0.05));
+                ui.painter_at(rect).rect_filled(r, 0.0, t.line);
             }
             if let Some(re) = v.highlight {
                 for m in re.find_iter(&b).take(200) {
                     let (a, z) = span(m.start(), m.end());
-                    text.rect_stroke(Rect::from_min_max(pos2(a, y + 1.0), pos2(z.max(a + 2.0), y + line_h - 1.0)), 2.0, (1.0, fg.gamma_multiply(0.45)), egui::StrokeKind::Inside);
+                    text.rect_stroke(Rect::from_min_max(pos2(a, y + 1.0), pos2(z.max(a + 2.0), y + line_h - 1.0)), 2.0, (1.0, t.matches), egui::StrokeKind::Inside);
                 }
             }
             if let Some(r) = &sel
@@ -665,16 +707,16 @@ impl Editor {
                 if r.end > le {
                     z += space;
                 }
-                text.rect_filled(Rect::from_min_max(pos2(a, y), pos2(z, y + line_h)), 2.0, fg.gamma_multiply(0.22));
+                text.rect_filled(Rect::from_min_max(pos2(a, y), pos2(z, y + line_h)), 2.0, t.selection);
             }
             text.galley(pos2(x0, y + pad), ctx.fonts_mut(|f| f.layout_no_wrap(display(&b), font.clone(), fg)), fg);
             if n == cur_line {
                 let cx = x0 + width(&ctx, font, &b[..(self.cursor - s).min(b.len())]);
-                let c = if active { fg } else { fg.gamma_multiply(0.35) };
+                let c = if active { t.cursor } else { t.cursor.gamma_multiply(0.35) };
                 text.rect_filled(Rect::from_min_size(pos2(cx - 1.0, y), vec2(2.0, line_h)), 1.0, c);
             }
             if v.gutter {
-                let c = if n == cur_line { fg.gamma_multiply(0.7) } else { fg.gamma_multiply(0.3) };
+                let c = if n == cur_line { fg.gamma_multiply(0.7) } else { t.numbers };
                 gutter.text(pos2(text_rect.left() - 14.0, y + pad), Align2::RIGHT_TOP, (n + 1).to_string(), font.clone(), c);
             }
         }

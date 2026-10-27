@@ -18,11 +18,20 @@ State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites
   can't be truncated/replaced by other programs while their tab is open. Search snapshots share the
   typed-text buffer (copy-on-write).
 - Memory: 5 x 1.5 GB docs + 25k-hit search peaks at 28 MB private; 2 MB after closing
+- Split view: each new pane gets its own empty tab (no mirroring); right-click a tab > Show in <pane>;
+  files dropped onto the window go to the pane under the mouse (asks Windows for the cursor, since
+  winit drops carry no position), which is highlighted while dragging
+- Appearance window: Colours / Font & size / Profiles tabs, Reset to defaults; 8 mappable theme parts
+  (background, text, cursor, selection, current line, line numbers, search matches, bars) painted from a
+  264-colour palette or an exact picker; profiles saved as profiles/<name>.cfg next to te.exe
 - GUI checked by hand: tabs, HTML + JSON pretty print, split view, search across tabs, folder panel, logo
 
 ## Open (pick up here)
-1. GUI-test by hand (not automatable while someone uses the PC): 4-pane grid, folder search result
-   in an unopened file, encode/decode + hash from menus, Save as / Save all, unsaved-changes prompts.
+1. GUI-test by hand (not automatable while someone uses the PC): a real drag-and-drop onto each pane,
+   profile Load/Delete, 4-pane grid, folder search result in an unopened file, encode/decode + hash
+   from menus, Save as / Save all, unsaved-changes prompts.
+   Testing note: SendKeys letters arrive as Unicode packets on a non-Latin layout (no Key event), so
+   use real virtual keys (keybd_event) when scripting shortcuts like Ctrl+Z.
 2. Known limits: same tab in two panes shares one scroll position; undo history resets on save;
    lines > 20k chars draw truncated; regex matches > 64 KiB across an 8 MiB block edge can be cut short.
 3. Solid colour presets: user said "leave it for now".
