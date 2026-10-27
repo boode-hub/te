@@ -1,6 +1,6 @@
 # Where to resume
 
-State (2026-10-28): builds clean, `cargo test --release` passes (4 suites; `bench` and `memory` are opt-in).
+State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites; `bench` and `memory` are opt-in).
 
 ## Done
 - Huge-file engine (mmap + piece table + sparse newline index), regex scan in 8 MiB blocks (doc.rs)
@@ -14,17 +14,15 @@ State (2026-10-28): builds clean, `cargo test --release` passes (4 suites; `benc
 - Encoders/decoders/hashes and JSON/XML/HTML/YAML/TOML/SQL/CSV formatters (tools.rs)
 - Tests: piece table + regex scan across block edges, every codec round trip, formatters,
   folder search, editor find/replace/tools/undo/line ops/save-and-reload (editor.rs)
+- No file locks for files under 64 MB (read into memory, handle closed); bigger files are mapped and
+  can't be truncated/replaced by other programs while their tab is open. Search snapshots share the
+  typed-text buffer (copy-on-write).
 - Memory: 5 x 1.5 GB docs + 25k-hit search peaks at 28 MB private; 2 MB after closing
 - GUI checked by hand: tabs, HTML + JSON pretty print, split view, search across tabs, folder panel, logo
 
 ## Open (pick up here)
-1. **File lock bug (next):** an open file is memory-mapped, so Windows blocks other programs from
-   overwriting/truncating it while te has it open. Fix in doc.rs `load`: read files under 64 MiB
-   into memory (no handle kept); mmap only bigger ones. Also share the typed-text buffer
-   (`add: Arc<Vec<u8>>`, `Arc::make_mut` in `insert`) so search snapshots never copy it.
-   Both edits were blocked because te had doc.rs open.
-2. GUI-test by hand (not automatable while someone uses the PC): 4-pane grid, folder search result
+1. GUI-test by hand (not automatable while someone uses the PC): 4-pane grid, folder search result
    in an unopened file, encode/decode + hash from menus, Save as / Save all, unsaved-changes prompts.
-3. Known limits: same tab in two panes shares one scroll position; undo history resets on save;
+2. Known limits: same tab in two panes shares one scroll position; undo history resets on save;
    lines > 20k chars draw truncated; regex matches > 64 KiB across an 8 MiB block edge can be cut short.
-4. Solid colour presets: user said "leave it for now".
+3. Solid colour presets: user said "leave it for now".

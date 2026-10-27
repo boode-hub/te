@@ -32,14 +32,36 @@ pub struct Piece {
     nl: usize,
 }
 
-/// Cloning is cheap except for the typed-text buffer: the mapping and index are shared. That is
-/// how a background search gets its own snapshot.
+/// Files smaller than this are read into memory and the file is closed at once, so te never
+/// locks them. Bigger ones are memory-mapped: Windows then blocks other programs from
+/// truncating or replacing that file until its tab is closed (appending still works).
+const READ_LIMIT: u64 = 64 << 20;
+
+/// The file's original bytes.
+enum Orig {
+    Mem(Vec<u8>),
+    Map(Mmap),
+}
+
+impl std::ops::Deref for Orig {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Orig::Mem(v) => v,
+            Orig::Map(m) => m,
+        }
+    }
+}
+
+/// Cloning is cheap: the original bytes, index and typed-text buffer are shared (the buffer is
+/// copied only if it is typed into while a clone is alive). That is how a background search
+/// gets its own snapshot.
 #[derive(Clone)]
 pub struct Doc {
-    orig: Option<Arc<Mmap>>,
+    orig: Option<Arc<Orig>>,
     /// index[i] = number of '\n' in orig before byte i*CHUNK; last entry = total.
     index: Arc<Vec<usize>>,
-    add: Vec<u8>,
+    add: Arc<Vec<u8>>,
     pieces: Vec<Piece>,
     pub crlf: bool,
 }
@@ -74,15 +96,23 @@ pub fn open(path: PathBuf) -> Loading {
     Loading { path, done, total, handle }
 }
 
-/// Maps the file and builds the newline index. `done` counts bytes indexed, for progress bars.
+/// Reads or maps the file and builds the newline index. `done` counts bytes indexed, for progress bars.
 pub fn load(path: &Path, done: &AtomicUsize) -> io::Result<Doc> {
-    let file = File::open(path)?;
-    if file.metadata()?.len() == 0 {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
         return Ok(Doc::new());
     }
-    // SAFETY: if another program truncates the file while it is open we may fault;
-    // every editor that maps files accepts this.
-    let map = unsafe { Mmap::map(&file)? };
+    let map = if len < READ_LIMIT {
+        let mut v = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut v)?;
+        Orig::Mem(v)
+    } else {
+        // SAFETY: the mapping locks the file against truncation on Windows, so it can't shrink under us.
+        Orig::Map(unsafe { Mmap::map(&file)? })
+    };
+    drop(file);
     // Count newlines per chunk on all cores (page faults dominate, so threads help), then
     // prefix-sum. Each thread takes at least 4 MiB, so small files use one.
     let mut counts = vec![0; map.len().div_ceil(CHUNK)];
@@ -112,17 +142,23 @@ pub fn load(path: &Path, done: &AtomicUsize) -> io::Result<Doc> {
 
 impl Doc {
     pub fn new() -> Doc {
-        Doc { orig: None, index: Arc::new(vec![0]), add: Vec::new(), pieces: Vec::new(), crlf: cfg!(windows) }
+        Doc { orig: None, index: Arc::new(vec![0]), add: Arc::default(), pieces: Vec::new(), crlf: cfg!(windows) }
     }
 
-    fn from_map(map: Mmap, index: Vec<usize>) -> Doc {
+    fn from_map(map: Orig, index: Vec<usize>) -> Doc {
         let crlf = memchr::memmem::find(&map[..map.len().min(CHUNK)], b"\r\n").is_some();
         let pieces = vec![Piece { src: Src::Orig, start: 0, len: map.len(), nl: *index.last().unwrap() }];
-        Doc { orig: Some(Arc::new(map)), index: Arc::new(index), add: Vec::new(), pieces, crlf }
+        Doc { orig: Some(Arc::new(map)), index: Arc::new(index), add: Arc::default(), pieces, crlf }
     }
 
     fn orig(&self) -> &[u8] {
         self.orig.as_deref().map_or(&[], |m| &m[..])
+    }
+
+    /// True if the file is memory-mapped (and so locked against being replaced while open).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.orig.as_deref(), Some(Orig::Map(_)))
     }
 
     fn slice(&self, p: &Piece) -> &[u8] {
@@ -270,8 +306,9 @@ impl Doc {
             return;
         }
         let i = self.split(at);
-        let start = self.add.len();
-        self.add.extend_from_slice(text);
+        let add = Arc::make_mut(&mut self.add);
+        let start = add.len();
+        add.extend_from_slice(text);
         let nl = count_nl(text);
         // Typing appends to the add buffer contiguously; grow the last piece instead of adding one.
         if i > 0 {
@@ -395,6 +432,7 @@ mod tests {
         }
         let path = std::env::temp_dir().join("te_test.txt");
         std::fs::write(&path, &model).unwrap();
+        let model_len_before_edits = model.len();
         let mut doc = open(path.clone()).join().unwrap();
         let re = Regex::new("zzQ").unwrap();
 
@@ -453,6 +491,21 @@ mod tests {
             true
         });
         assert_eq!(empties, 4);
+
+        // Small files are read, not mapped, so other programs can still replace them while open.
+        assert!(!small.is_mapped() && !doc.is_mapped());
+        std::fs::write(&path, b"replaced while open").unwrap();
+        let tmp = path.with_extension("new");
+        std::fs::write(&tmp, b"renamed over").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        assert_eq!(small.len(), model_len_before_edits);
+
+        // A snapshot keeps its text when the original is typed into afterwards.
+        let mut a = Doc::new();
+        a.insert(0, b"abc");
+        let b = a.clone();
+        a.insert(3, b"d");
+        assert_eq!((a.bytes(0..a.len()), b.bytes(0..b.len())), (b"abcd".to_vec(), b"abc".to_vec()));
         let _ = std::fs::remove_file(&path);
     }
 
