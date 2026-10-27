@@ -1,0 +1,691 @@
+//! One open document (a tab): its text, cursor, scroll position and undo history, plus drawing it.
+
+use crate::doc::{self, Doc, Loading, Piece};
+use eframe::egui::{self, Align2, Color32, CornerRadius, Event, FontId, Key, Modifiers, Rect, Sense, pos2, vec2};
+use regex::bytes::{NoExpand, Regex};
+use std::ops::Range;
+use std::path::PathBuf;
+
+// ponytail: lines longer than this are drawn truncated; window the horizontal range if it matters.
+pub const MAX_LINE: usize = 20_000;
+const UNDO_LIMIT: usize = 1000;
+/// Whole-document tools (format, replace all, line ops) need the text in memory; cap it.
+pub const TRANSFORM_LIMIT: usize = 256 << 20;
+
+/// How to draw, shared by every pane.
+pub struct View<'a> {
+    pub font: FontId,
+    pub fg: Color32,
+    pub gutter: bool,
+    pub spacing: f32,
+    pub highlight: Option<&'a Regex>,
+}
+
+pub struct Editor {
+    pub id: u64,
+    pub doc: Doc,
+    pub path: Option<PathBuf>,
+    pub loading: Option<Loading>,
+    /// Selection and scroll to apply once loading finishes.
+    restore: Option<(Range<usize>, f64)>,
+    pub modified: bool,
+    pub cursor: usize,
+    pub anchor: Option<usize>,
+    goal_x: Option<f32>,
+    top: f64, // first visible line; fractional for smooth scrolling
+    scroll_x: f32,
+    follow: bool,
+    undo: Vec<(Vec<Piece>, usize)>,
+    redo: Vec<(Vec<Piece>, usize)>,
+    typing: bool,
+    rows: usize,
+    /// Message for the status bar, taken by the app each frame.
+    pub msg: Option<String>,
+}
+
+/// Tabs aren't handled by egui's layout, so draw each as 4 spaces.
+fn display(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).replace('\t', "    ")
+}
+
+/// Byte offset in `b` of display-char index `ci` (inverse of `display`).
+fn byte_of_display(b: &[u8], ci: usize) -> usize {
+    let s = String::from_utf8_lossy(b);
+    let mut acc = 0;
+    for (i, c) in s.char_indices() {
+        acc += if c == '\t' { 4 } else { 1 };
+        if acc > ci {
+            return i.min(b.len());
+        }
+    }
+    b.len()
+}
+
+pub fn width(ctx: &egui::Context, font: &FontId, b: &[u8]) -> f32 {
+    ctx.fonts_mut(|f| f.layout_no_wrap(display(b), font.clone(), Color32::WHITE).size().x)
+}
+
+impl Editor {
+    pub fn new(id: u64) -> Editor {
+        Editor {
+            id,
+            doc: Doc::new(),
+            path: None,
+            loading: None,
+            restore: None,
+            modified: false,
+            cursor: 0,
+            anchor: None,
+            goal_x: None,
+            top: 0.0,
+            scroll_x: 0.0,
+            follow: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            typing: false,
+            rows: 30,
+            msg: None,
+        }
+    }
+
+    pub fn open(id: u64, path: PathBuf) -> Editor {
+        let mut e = Editor::new(id);
+        e.start_load(path, None);
+        e
+    }
+
+    pub fn name(&self) -> String {
+        let p = self.loading.as_ref().map(|l| &l.path).or(self.path.as_ref());
+        p.and_then(|p| p.file_name()).map_or("untitled".into(), |n| n.to_string_lossy().into_owned())
+    }
+
+    /// An empty untitled tab nobody has touched; opening a file reuses it.
+    pub fn is_pristine(&self) -> bool {
+        self.path.is_none() && self.loading.is_none() && !self.modified && self.doc.len() == 0
+    }
+
+    fn start_load(&mut self, path: PathBuf, restore: Option<(Range<usize>, f64)>) {
+        self.doc = Doc::new();
+        self.undo.clear();
+        self.redo.clear();
+        self.modified = false;
+        self.restore = restore;
+        self.loading = Some(doc::open(path));
+    }
+
+    /// Finishes a background load. Returns the path when a file just opened successfully.
+    pub fn poll(&mut self) -> Option<PathBuf> {
+        if !self.loading.as_ref().is_some_and(|l| l.is_finished()) {
+            return None;
+        }
+        let l = self.loading.take().unwrap();
+        let path = l.path.clone();
+        match l.join() {
+            Ok(doc) => {
+                self.doc = doc;
+                self.path = Some(path.clone());
+                let (sel, top) = self.restore.take().unwrap_or((0..0, 0.0));
+                let len = self.doc.len();
+                self.anchor = (sel.start != sel.end).then_some(sel.start.min(len));
+                self.cursor = sel.end.min(len);
+                self.top = top;
+                self.follow = top == 0.0 && self.cursor > 0;
+                Some(path)
+            }
+            Err(e) => {
+                self.msg = Some(format!("Can't open {}: {e}", path.display()));
+                None
+            }
+        }
+    }
+
+    pub fn reload(&mut self) {
+        if let Some(p) = self.path.clone() {
+            self.start_load(p, Some((self.cursor..self.cursor, self.top)));
+        }
+    }
+
+    /// Asks before throwing away edits. Returns false if the user cancelled.
+    pub fn confirm_discard(&mut self) -> bool {
+        if !self.modified {
+            return true;
+        }
+        use rfd::{MessageButtons, MessageDialogResult};
+        match rfd::MessageDialog::new()
+            .set_title("te")
+            .set_description(format!("Save changes to {}?", self.name()))
+            .set_buttons(MessageButtons::YesNoCancel)
+            .show()
+        {
+            MessageDialogResult::Yes => self.save(false),
+            MessageDialogResult::No => true,
+            _ => false,
+        }
+    }
+
+    fn save_dialog(&self) -> Option<PathBuf> {
+        let mut d = rfd::FileDialog::new().set_file_name(self.name());
+        if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) {
+            d = d.set_directory(dir);
+        }
+        d.save_file()
+    }
+
+    /// Writes to a temp file, then swaps it in, so a failed save never damages the original.
+    pub fn save(&mut self, save_as: bool) -> bool {
+        let path = match (&self.path, save_as) {
+            (Some(p), false) => p.clone(),
+            _ => match self.save_dialog() {
+                Some(p) => p,
+                None => return false,
+            },
+        };
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".te-tmp");
+        let tmp = PathBuf::from(tmp);
+        if let Err(e) = self.doc.write_to(&tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            self.msg = Some(format!("Save failed: {e}"));
+            return false;
+        }
+        let restore = Some((self.anchor.unwrap_or(self.cursor)..self.cursor, self.top));
+        self.doc = Doc::new(); // release the mapping so Windows lets us replace the file
+        match std::fs::rename(&tmp, &path) {
+            Ok(()) => {
+                self.start_load(path, restore);
+                self.msg = Some("Saved".into());
+            }
+            Err(e) => {
+                self.start_load(tmp.clone(), restore);
+                self.msg = Some(format!("Couldn't replace file ({e}); your text is safe in {}", tmp.display()));
+            }
+        }
+        true
+    }
+
+    /// Writes the text elsewhere and keeps editing this file.
+    pub fn save_copy(&mut self) {
+        if let Some(p) = self.save_dialog() {
+            self.msg = Some(match self.doc.write_to(&p) {
+                Ok(()) => format!("Copy saved to {}", p.display()),
+                Err(e) => format!("Save failed: {e}"),
+            });
+        }
+    }
+
+    // ---------- editing ----------
+
+    pub fn selection(&self) -> Option<Range<usize>> {
+        self.anchor.filter(|&a| a != self.cursor).map(|a| a.min(self.cursor)..a.max(self.cursor))
+    }
+
+    fn begin_edit(&mut self, typing: bool) {
+        if !(typing && self.typing) {
+            self.undo.push((self.doc.snapshot(), self.cursor));
+            if self.undo.len() > UNDO_LIMIT {
+                self.undo.remove(0);
+            }
+        }
+        self.typing = typing;
+        self.redo.clear();
+        self.modified = true;
+        self.goal_x = None;
+        self.follow = true;
+    }
+
+    pub fn insert(&mut self, text: &[u8], typing: bool) {
+        if self.loading.is_some() {
+            return;
+        }
+        let sel = self.selection();
+        self.begin_edit(typing && sel.is_none() && !text.contains(&b'\n'));
+        if let Some(r) = sel {
+            self.doc.delete(r.clone());
+            self.cursor = r.start;
+        }
+        self.anchor = None;
+        self.doc.insert(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    pub fn delete(&mut self, r: Range<usize>) {
+        if r.is_empty() || self.loading.is_some() {
+            return;
+        }
+        self.begin_edit(false);
+        self.doc.delete(r.clone());
+        self.cursor = r.start;
+        self.anchor = None;
+    }
+
+    pub fn undo_redo(&mut self, redo: bool) {
+        let (from, to) = if redo { (&mut self.redo, &mut self.undo) } else { (&mut self.undo, &mut self.redo) };
+        if let Some((pieces, cursor)) = from.pop() {
+            to.push((self.doc.snapshot(), self.cursor));
+            self.doc.restore(pieces);
+            self.cursor = cursor.min(self.doc.len());
+            self.anchor = None;
+            self.typing = false;
+            self.modified = true;
+            self.follow = true;
+        }
+    }
+
+    fn move_to(&mut self, pos: usize, shift: bool) {
+        if shift {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = pos;
+        self.typing = false;
+        self.follow = true;
+    }
+
+    /// Selects `r` and scrolls to it (after loading, if the file is still opening).
+    pub fn jump(&mut self, r: Range<usize>) {
+        if self.loading.is_some() {
+            self.restore = Some((r, 0.0));
+            return;
+        }
+        let len = self.doc.len();
+        self.anchor = Some(r.start.min(len));
+        self.cursor = r.end.min(len);
+        self.typing = false;
+        self.follow = true;
+    }
+
+    pub fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.doc.len();
+    }
+
+    pub fn selected_text(&self, max: usize) -> Option<String> {
+        self.selection().filter(|r| r.len() <= max).map(|r| String::from_utf8_lossy(&self.doc.bytes(r)).into_owned())
+    }
+
+    pub fn copy(&mut self, ctx: &egui::Context, cut: bool) {
+        if let Some(r) = self.selection() {
+            if r.len() > TRANSFORM_LIMIT {
+                self.msg = Some("Selection too large for the clipboard".into());
+                return;
+            }
+            ctx.copy_text(String::from_utf8_lossy(&self.doc.bytes(r.clone())).into_owned());
+            if cut {
+                self.delete(r);
+            }
+        }
+    }
+
+    pub fn goto_line(&mut self, n: usize) {
+        let n = n.clamp(1, self.doc.line_count()) - 1;
+        self.move_to(self.doc.line_start(n), false);
+        self.top = (n as f64 - self.rows as f64 / 2.0).max(0.0);
+    }
+
+    pub fn duplicate_line(&mut self) {
+        let line = self.doc.line_of(self.cursor);
+        let s = self.doc.line_start(line);
+        let e = if line + 1 < self.doc.line_count() { self.doc.line_start(line + 1) } else { self.doc.len() };
+        let mut text = self.doc.bytes(s..e.min(s + TRANSFORM_LIMIT));
+        if !text.ends_with(b"\n") {
+            text.extend_from_slice(if self.doc.crlf { b"\r\n" } else { b"\n" });
+        }
+        let (c, a) = (self.cursor, self.anchor);
+        self.anchor = None;
+        self.cursor = s;
+        self.insert(&text, false);
+        self.cursor = c + text.len();
+        self.anchor = a.map(|a| a + text.len());
+    }
+
+    pub fn delete_line(&mut self) {
+        let line = self.doc.line_of(self.cursor);
+        let r = if line + 1 < self.doc.line_count() {
+            self.doc.line_start(line)..self.doc.line_start(line + 1)
+        } else if line > 0 {
+            self.doc.line_end(line - 1)..self.doc.len()
+        } else {
+            0..self.doc.len()
+        };
+        self.delete(r);
+    }
+
+    /// Runs `f` over the selection (or the whole document) and puts the result in its place,
+    /// selected, as one undo step.
+    pub fn transform(&mut self, name: &str, f: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>) {
+        let r = self.selection().unwrap_or(0..self.doc.len());
+        self.transform_range(r, name, f);
+    }
+
+    pub fn transform_range(&mut self, r: Range<usize>, name: &str, f: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>) {
+        if self.loading.is_some() {
+            return;
+        }
+        if r.len() > TRANSFORM_LIMIT {
+            self.msg = Some(format!("{name}: that's over 256 MB; select a smaller part"));
+            return;
+        }
+        let input = self.doc.bytes(r.clone());
+        match f(&input) {
+            Ok(out) if out == input => self.msg = Some(format!("{name}: nothing to change")),
+            Ok(out) => {
+                self.begin_edit(false);
+                self.doc.delete(r.clone());
+                self.doc.insert(r.start, &out);
+                self.anchor = Some(r.start);
+                self.cursor = r.start + out.len();
+                self.msg = Some(name.to_string());
+            }
+            Err(e) => self.msg = Some(format!("{name}: {e}")),
+        }
+    }
+
+    /// The bytes a hash or similar read-only tool should look at.
+    pub fn input(&self) -> Result<Vec<u8>, String> {
+        let r = self.selection().unwrap_or(0..self.doc.len());
+        if r.len() > TRANSFORM_LIMIT {
+            return Err("that's over 256 MB; select a smaller part".into());
+        }
+        Ok(self.doc.bytes(r))
+    }
+
+    pub fn set_line_endings(&mut self, crlf: bool) {
+        self.transform_range(0..self.doc.len(), if crlf { "Line endings: CRLF" } else { "Line endings: LF" }, |b| {
+            let lf = regex::bytes::Regex::new("\r\n").unwrap().replace_all(b, NoExpand(b"\n")).into_owned();
+            Ok(if crlf { regex::bytes::Regex::new("\n").unwrap().replace_all(&lf, NoExpand(b"\r\n")).into_owned() } else { lf })
+        });
+        self.doc.crlf = crlf;
+    }
+
+    // ---------- find / replace ----------
+
+    pub fn find_next(&mut self, re: &Regex, forward: bool) -> bool {
+        let sel = self.selection().unwrap_or(self.cursor..self.cursor);
+        let from = if forward { sel.end } else { sel.start };
+        let wrap = if forward { 0 } else { self.doc.len() };
+        let mut hit = self.doc.find(re, from, forward);
+        // An empty match (e.g. `^`) right at the cursor would be found again forever; step past it.
+        if hit.as_ref().is_some_and(|r| r.is_empty() && r.start == self.cursor) {
+            hit = if forward { self.doc.find(re, from + 1, true) } else { self.doc.find(re, from.saturating_sub(1), false) };
+        }
+        match hit.or_else(|| self.doc.find(re, wrap, forward)) {
+            Some(r) => {
+                self.jump(r);
+                true
+            }
+            None => {
+                self.msg = Some("No matches".into());
+                false
+            }
+        }
+    }
+
+    /// Replaces the selection if it is a match, then moves to the next match.
+    pub fn replace_one(&mut self, re: &Regex, rep: &str, expand: bool) {
+        if let Some(r) = self.selection() {
+            let sel = self.doc.bytes(r.clone());
+            if re.find(&sel).is_some_and(|m| m.start() == 0 && m.end() == sel.len()) {
+                let new = if expand { re.replace(&sel, rep.as_bytes()).into_owned() } else { rep.as_bytes().to_vec() };
+                self.insert(&new, false);
+            }
+        }
+        self.find_next(re, true);
+    }
+
+    pub fn replace_all(&mut self, re: &Regex, rep: &str, expand: bool) {
+        let mut count = 0;
+        self.transform_range(0..self.doc.len(), "Replace all", |b| {
+            count = re.find_iter(b).count();
+            Ok(if expand { re.replace_all(b, rep.as_bytes()).into_owned() } else { re.replace_all(b, NoExpand(rep.as_bytes())).into_owned() })
+        });
+        if count > 0 {
+            self.msg = Some(format!("Replaced {count}"));
+        }
+    }
+
+    // ---------- layout helpers ----------
+
+    fn line_bytes(&self, n: usize) -> (usize, Vec<u8>) {
+        let s = self.doc.line_start(n);
+        let e = self.doc.line_end(n).min(s + MAX_LINE);
+        (s, self.doc.bytes(s..e))
+    }
+
+    fn x_of(&self, ctx: &egui::Context, font: &FontId, pos: usize) -> f32 {
+        let (s, b) = self.line_bytes(self.doc.line_of(pos));
+        width(ctx, font, &b[..(pos - s).min(b.len())])
+    }
+
+    fn pos_at_x(&self, ctx: &egui::Context, font: &FontId, line: usize, x: f32) -> usize {
+        let (s, b) = self.line_bytes(line.min(self.doc.line_count() - 1));
+        let g = ctx.fonts_mut(|f| f.layout_no_wrap(display(&b), font.clone(), Color32::WHITE));
+        s + byte_of_display(&b, g.cursor_from_pos(vec2(x, 0.0)).index.0)
+    }
+
+    pub fn line_col(&self) -> (usize, usize) {
+        let line = self.doc.line_of(self.cursor);
+        let ls = self.doc.line_start(line);
+        let col = self.doc.bytes(ls..self.cursor.min(ls + MAX_LINE)).iter().filter(|&&c| c & 0xC0 != 0x80).count();
+        (line + 1, col + 1)
+    }
+
+    // ---------- input ----------
+
+    fn keys(&mut self, ctx: &egui::Context, font: &FontId) {
+        for ev in ctx.input(|i| i.events.clone()) {
+            match ev {
+                Event::Text(t) => self.insert(t.as_bytes(), true),
+                Event::Paste(t) => self.insert(t.as_bytes(), false),
+                Event::Copy => self.copy(ctx, false),
+                Event::Cut => self.copy(ctx, true),
+                Event::Key { key, pressed: true, modifiers: m, .. } => self.key(ctx, font, key, m),
+                _ => {}
+            }
+        }
+    }
+
+    fn key(&mut self, ctx: &egui::Context, font: &FontId, key: Key, m: Modifiers) {
+        let d = &self.doc;
+        let line = d.line_of(self.cursor);
+        let vertical = |rows: isize| (line as isize + rows).clamp(0, d.line_count() as isize - 1) as usize;
+        let page = self.rows.saturating_sub(1).max(1) as isize;
+        match key {
+            Key::ArrowLeft => self.move_to(d.prev_char(self.cursor), m.shift),
+            Key::ArrowRight => self.move_to(d.next_char(self.cursor), m.shift),
+            Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown => {
+                let delta = match key {
+                    Key::ArrowUp => -1,
+                    Key::ArrowDown => 1,
+                    Key::PageUp => -page,
+                    _ => page,
+                };
+                let target = vertical(delta);
+                let x = self.goal_x.unwrap_or_else(|| self.x_of(ctx, font, self.cursor));
+                let pos = self.pos_at_x(ctx, font, target, x);
+                if matches!(key, Key::PageUp | Key::PageDown) {
+                    self.top = (self.top + delta as f64).max(0.0);
+                }
+                self.move_to(pos, m.shift);
+                self.goal_x = Some(x);
+                return;
+            }
+            Key::Home => self.move_to(if m.command { 0 } else { d.line_start(line) }, m.shift),
+            Key::End => self.move_to(if m.command { d.len() } else { d.line_end(line) }, m.shift),
+            Key::Enter => self.insert(if d.crlf { b"\r\n" } else { b"\n" }, false),
+            Key::Tab => self.insert(b"\t", true),
+            Key::Backspace => match self.selection() {
+                Some(r) => self.delete(r),
+                None => self.delete(d.prev_char(self.cursor)..self.cursor),
+            },
+            Key::Delete => match self.selection() {
+                Some(r) => self.delete(r),
+                None => self.delete(self.cursor..d.next_char(self.cursor)),
+            },
+            Key::A if m.command => self.select_all(),
+            Key::Z if m.command => self.undo_redo(m.shift),
+            Key::Y if m.command => self.undo_redo(true),
+            Key::D if m.command => self.duplicate_line(),
+            Key::K if m.command && m.shift => self.delete_line(),
+            _ => return,
+        }
+        self.goal_x = None;
+    }
+
+    // ---------- drawing ----------
+
+    /// Draws into the whole of `ui`. Keyboard input is handled only when `active`.
+    pub fn draw(&mut self, ui: &mut egui::Ui, v: &View, active: bool) -> egui::Response {
+        let ctx = ui.ctx().clone();
+        let fg = v.fg;
+        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        if let Some(l) = &self.loading {
+            let p = if l.total == 0 { 0.0 } else { l.done.load(std::sync::atomic::Ordering::Relaxed) as f32 / l.total as f32 };
+            let painter = ui.painter_at(rect);
+            painter.text(rect.center() - vec2(0.0, 14.0), Align2::CENTER_CENTER, format!("Opening {}", self.name()), FontId::proportional(14.0), fg.gamma_multiply(0.7));
+            let track = Rect::from_center_size(rect.center() + vec2(0.0, 10.0), vec2(240.0, 3.0));
+            painter.rect_filled(track, 2.0, fg.gamma_multiply(0.12));
+            painter.rect_filled(Rect::from_min_size(track.min, vec2(240.0 * p.min(1.0), 3.0)), 2.0, fg);
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return resp;
+        }
+
+        let font = &v.font;
+        let row_h = ctx.fonts_mut(|f| f.row_height(font));
+        let line_h = row_h * v.spacing;
+        let pad = (line_h - row_h) / 2.0;
+        let id = resp.id;
+
+        if active && ctx.memory(|m| m.focused().is_none()) {
+            resp.request_focus();
+        }
+        if active && resp.has_focus() {
+            ctx.memory_mut(|m| {
+                m.set_focus_lock_filter(id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: false })
+            });
+            self.keys(&ctx, font);
+        }
+
+        let lines = self.doc.line_count();
+        let digits = lines.to_string().len().max(3);
+        let gutter_w = if v.gutter { width(&ctx, font, &b"0".repeat(digits)) + 24.0 } else { 12.0 };
+        let bar_w = 10.0;
+        let text_rect = Rect::from_min_max(pos2(rect.left() + gutter_w, rect.top()), pos2(rect.right() - bar_w, rect.bottom()));
+        self.rows = (rect.height() / line_h).floor().max(1.0) as usize;
+        let max_top = (lines - 1) as f64;
+
+        // Mouse
+        if resp.hovered() {
+            let d = ctx.input(|i| i.smooth_scroll_delta);
+            self.top -= (d.y / line_h) as f64;
+            self.scroll_x -= d.x;
+        }
+        if let Some(p) = resp.interact_pointer_pos() {
+            let line = (self.top + ((p.y - rect.top()) / line_h) as f64).max(0.0) as usize;
+            let pos = self.pos_at_x(&ctx, font, line, p.x - text_rect.left() + self.scroll_x);
+            let (pressed, shift) = ctx.input(|i| (i.pointer.primary_pressed(), i.modifiers.shift));
+            if pressed && !shift {
+                self.anchor = Some(pos);
+            } else if pressed {
+                self.anchor.get_or_insert(self.cursor);
+            }
+            self.cursor = pos;
+            self.goal_x = None;
+            self.typing = false;
+            resp.request_focus();
+            // Dragging past the top or bottom edge keeps selecting.
+            if p.y < rect.top() || p.y > rect.bottom() {
+                self.top += if p.y < rect.top() { -1.0 } else { 1.0 };
+                ctx.request_repaint();
+            }
+        }
+
+        // Keep the cursor on screen after keyboard moves
+        if std::mem::take(&mut self.follow) {
+            let cl = self.doc.line_of(self.cursor) as f64;
+            let rows = self.rows as f64;
+            if cl < self.top {
+                self.top = (cl - rows / 3.0).max(0.0).min(cl);
+            } else if cl > self.top + rows - 1.0 {
+                self.top = cl - rows + 1.0;
+            }
+            let cx = self.x_of(&ctx, font, self.cursor);
+            let w = text_rect.width();
+            if cx < self.scroll_x {
+                self.scroll_x = (cx - w * 0.25).max(0.0);
+            } else if cx > self.scroll_x + w - 20.0 {
+                self.scroll_x = cx - w * 0.75;
+            }
+        }
+
+        // Scrollbar
+        let track = Rect::from_min_max(pos2(rect.right() - bar_w, rect.top()), rect.right_bottom());
+        let thumb_h = (rect.height() * self.rows as f32 / (lines + self.rows) as f32).clamp(28.0, rect.height());
+        let bar = ui.interact(track, id.with("vbar"), Sense::click_and_drag());
+        if let Some(p) = bar.interact_pointer_pos() {
+            let t = ((p.y - rect.top() - thumb_h / 2.0) / (rect.height() - thumb_h)).clamp(0.0, 1.0);
+            self.top = t as f64 * max_top;
+        }
+        self.top = self.top.clamp(0.0, max_top);
+        self.scroll_x = self.scroll_x.max(0.0);
+
+        // Text
+        let gutter = ui.painter_at(Rect::from_min_max(rect.min, pos2(text_rect.left(), rect.bottom())));
+        let text = ui.painter_at(text_rect);
+        let first = self.top.floor() as usize;
+        let frac = (self.top - first as f64) as f32;
+        let x0 = text_rect.left() - self.scroll_x;
+        let sel = self.selection();
+        let cur_line = self.doc.line_of(self.cursor);
+        let space = width(&ctx, font, b" ");
+        for i in 0..=self.rows + 1 {
+            let n = first + i;
+            if n >= lines {
+                break;
+            }
+            let y = rect.top() + (i as f32 - frac) * line_h;
+            let (s, b) = self.line_bytes(n);
+            let le = s + b.len();
+            let span = |a: usize, z: usize| (x0 + width(&ctx, font, &b[..a]), x0 + width(&ctx, font, &b[..z]));
+            if n == cur_line && active {
+                let r = Rect::from_min_size(pos2(rect.left(), y), vec2(rect.width() - bar_w, line_h));
+                ui.painter_at(rect).rect_filled(r, 0.0, fg.gamma_multiply(0.05));
+            }
+            if let Some(re) = v.highlight {
+                for m in re.find_iter(&b).take(200) {
+                    let (a, z) = span(m.start(), m.end());
+                    text.rect_stroke(Rect::from_min_max(pos2(a, y + 1.0), pos2(z.max(a + 2.0), y + line_h - 1.0)), 2.0, (1.0, fg.gamma_multiply(0.45)), egui::StrokeKind::Inside);
+                }
+            }
+            if let Some(r) = &sel
+                && r.start <= le
+                && r.end > s
+            {
+                let (a, mut z) = span(r.start.max(s) - s, r.end.min(le) - s);
+                if r.end > le {
+                    z += space;
+                }
+                text.rect_filled(Rect::from_min_max(pos2(a, y), pos2(z, y + line_h)), 2.0, fg.gamma_multiply(0.22));
+            }
+            text.galley(pos2(x0, y + pad), ctx.fonts_mut(|f| f.layout_no_wrap(display(&b), font.clone(), fg)), fg);
+            if n == cur_line {
+                let cx = x0 + width(&ctx, font, &b[..(self.cursor - s).min(b.len())]);
+                let c = if active { fg } else { fg.gamma_multiply(0.35) };
+                text.rect_filled(Rect::from_min_size(pos2(cx - 1.0, y), vec2(2.0, line_h)), 1.0, c);
+            }
+            if v.gutter {
+                let c = if n == cur_line { fg.gamma_multiply(0.7) } else { fg.gamma_multiply(0.3) };
+                gutter.text(pos2(text_rect.left() - 14.0, y + pad), Align2::RIGHT_TOP, (n + 1).to_string(), font.clone(), c);
+            }
+        }
+
+        // Scrollbar thumb, drawn last so it sits on top
+        if lines > 1 {
+            let y = rect.top() + (self.top / max_top) as f32 * (rect.height() - thumb_h);
+            let alpha = if bar.hovered() || bar.dragged() { 0.35 } else { 0.14 };
+            let thumb = Rect::from_min_size(pos2(track.left() + 2.0, y), vec2(bar_w - 4.0, thumb_h));
+            ui.painter().rect_filled(thumb, CornerRadius::same(4), fg.gamma_multiply(alpha));
+        }
+        resp.union(bar)
+    }
+}
