@@ -63,6 +63,14 @@ pub struct View<'a> {
     pub highlight: Option<&'a Regex>,
 }
 
+/// Where one pane is scrolled to. Each pane keeps its own per tab, so two panes on the same file
+/// scroll independently.
+#[derive(Clone, Copy, Default)]
+pub struct PaneView {
+    pub top: f64, // first visible line; fractional for smooth scrolling
+    pub scroll_x: f32,
+}
+
 pub struct Editor {
     pub id: u64,
     pub doc: Doc,
@@ -74,8 +82,12 @@ pub struct Editor {
     pub cursor: usize,
     pub anchor: Option<usize>,
     goal_x: Option<f32>,
-    top: f64, // first visible line; fractional for smooth scrolling
-    scroll_x: f32,
+    /// Scroll position last seen in the active pane: used when saving/reloading and when the tab
+    /// is first shown in another pane. Each pane scrolls on its own via `PaneView`.
+    pub top: f64,
+    pub scroll_x: f32,
+    /// Scroll the active pane here on its next draw (Go to line, Page Up/Down, reopen).
+    pending_top: Option<f64>,
     follow: bool,
     undo: Vec<(Vec<Piece>, usize)>,
     redo: Vec<(Vec<Piece>, usize)>,
@@ -121,6 +133,7 @@ impl Editor {
             goal_x: None,
             top: 0.0,
             scroll_x: 0.0,
+            pending_top: None,
             follow: false,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -171,6 +184,7 @@ impl Editor {
                 self.anchor = (sel.start != sel.end).then_some(sel.start.min(len));
                 self.cursor = sel.end.min(len);
                 self.top = top;
+                self.pending_top = Some(top);
                 self.follow = top == 0.0 && self.cursor > 0;
                 Some(path)
             }
@@ -362,7 +376,7 @@ impl Editor {
     pub fn goto_line(&mut self, n: usize) {
         let n = n.clamp(1, self.doc.line_count()) - 1;
         self.move_to(self.doc.line_start(n), false);
-        self.top = (n as f64 - self.rows as f64 / 2.0).max(0.0);
+        self.pending_top = Some((n as f64 - self.rows as f64 / 2.0).max(0.0));
     }
 
     pub fn duplicate_line(&mut self) {
@@ -546,7 +560,7 @@ impl Editor {
                 let x = self.goal_x.unwrap_or_else(|| self.x_of(ctx, font, self.cursor));
                 let pos = self.pos_at_x(ctx, font, target, x);
                 if matches!(key, Key::PageUp | Key::PageDown) {
-                    self.top = (self.top + delta as f64).max(0.0);
+                    self.pending_top = Some((self.top + delta as f64).max(0.0));
                 }
                 self.move_to(pos, m.shift);
                 self.goal_x = Some(x);
@@ -576,8 +590,9 @@ impl Editor {
 
     // ---------- drawing ----------
 
-    /// Draws into the whole of `ui`. Keyboard input is handled only when `active`.
-    pub fn draw(&mut self, ui: &mut egui::Ui, v: &View, active: bool) -> egui::Response {
+    /// Draws into the whole of `ui`, scrolled to `vs` (each pane has its own). Keyboard input is
+    /// handled only when `active`.
+    pub fn draw(&mut self, ui: &mut egui::Ui, v: &View, active: bool, vs: &mut PaneView) -> egui::Response {
         let ctx = ui.ctx().clone();
         let (fg, t) = (v.theme.fg, v.theme);
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
@@ -605,7 +620,11 @@ impl Editor {
             ctx.memory_mut(|m| {
                 m.set_focus_lock_filter(id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: false })
             });
+            self.top = vs.top; // so Page Up/Down start from this pane's position
             self.keys(&ctx, font);
+        }
+        if active && let Some(t) = self.pending_top.take() {
+            vs.top = t;
         }
 
         let lines = self.doc.line_count();
@@ -613,18 +632,21 @@ impl Editor {
         let gutter_w = if v.gutter { width(&ctx, font, &b"0".repeat(digits)) + 24.0 } else { 12.0 };
         let bar_w = 10.0;
         let text_rect = Rect::from_min_max(pos2(rect.left() + gutter_w, rect.top()), pos2(rect.right() - bar_w, rect.bottom()));
-        self.rows = (rect.height() / line_h).floor().max(1.0) as usize;
+        let rows = (rect.height() / line_h).floor().max(1.0) as usize;
+        if active {
+            self.rows = rows;
+        }
         let max_top = (lines - 1) as f64;
 
         // Mouse
         if resp.hovered() {
             let d = ctx.input(|i| i.smooth_scroll_delta);
-            self.top -= (d.y / line_h) as f64;
-            self.scroll_x -= d.x;
+            vs.top -= (d.y / line_h) as f64;
+            vs.scroll_x -= d.x;
         }
         if let Some(p) = resp.interact_pointer_pos() {
-            let line = (self.top + ((p.y - rect.top()) / line_h) as f64).max(0.0) as usize;
-            let pos = self.pos_at_x(&ctx, font, line, p.x - text_rect.left() + self.scroll_x);
+            let line = (vs.top + ((p.y - rect.top()) / line_h) as f64).max(0.0) as usize;
+            let pos = self.pos_at_x(&ctx, font, line, p.x - text_rect.left() + vs.scroll_x);
             let (pressed, shift) = ctx.input(|i| (i.pointer.primary_pressed(), i.modifiers.shift));
             if pressed && !shift {
                 self.anchor = Some(pos);
@@ -637,50 +659,50 @@ impl Editor {
             resp.request_focus();
             // Dragging past the top or bottom edge keeps selecting.
             if p.y < rect.top() || p.y > rect.bottom() {
-                self.top += if p.y < rect.top() { -1.0 } else { 1.0 };
+                vs.top += if p.y < rect.top() { -1.0 } else { 1.0 };
                 ctx.request_repaint();
             }
         }
 
-        // Keep the cursor on screen after keyboard moves
-        if std::mem::take(&mut self.follow) {
+        // Keep the cursor on screen after keyboard moves (in the pane being typed in)
+        if active && std::mem::take(&mut self.follow) {
             let cl = self.doc.line_of(self.cursor) as f64;
-            let rows = self.rows as f64;
-            if cl < self.top {
-                self.top = (cl - rows / 3.0).max(0.0).min(cl);
-            } else if cl > self.top + rows - 1.0 {
-                self.top = cl - rows + 1.0;
+            let rows = rows as f64;
+            if cl < vs.top {
+                vs.top = (cl - rows / 3.0).max(0.0).min(cl);
+            } else if cl > vs.top + rows - 1.0 {
+                vs.top = cl - rows + 1.0;
             }
             let cx = self.x_of(&ctx, font, self.cursor);
             let w = text_rect.width();
-            if cx < self.scroll_x {
-                self.scroll_x = (cx - w * 0.25).max(0.0);
-            } else if cx > self.scroll_x + w - 20.0 {
-                self.scroll_x = cx - w * 0.75;
+            if cx < vs.scroll_x {
+                vs.scroll_x = (cx - w * 0.25).max(0.0);
+            } else if cx > vs.scroll_x + w - 20.0 {
+                vs.scroll_x = cx - w * 0.75;
             }
         }
 
         // Scrollbar
         let track = Rect::from_min_max(pos2(rect.right() - bar_w, rect.top()), rect.right_bottom());
-        let thumb_h = (rect.height() * self.rows as f32 / (lines + self.rows) as f32).clamp(28.0, rect.height());
+        let thumb_h = (rect.height() * rows as f32 / (lines + rows) as f32).clamp(28.0, rect.height());
         let bar = ui.interact(track, id.with("vbar"), Sense::click_and_drag());
         if let Some(p) = bar.interact_pointer_pos() {
             let t = ((p.y - rect.top() - thumb_h / 2.0) / (rect.height() - thumb_h)).clamp(0.0, 1.0);
-            self.top = t as f64 * max_top;
+            vs.top = t as f64 * max_top;
         }
-        self.top = self.top.clamp(0.0, max_top);
-        self.scroll_x = self.scroll_x.max(0.0);
+        vs.top = vs.top.clamp(0.0, max_top);
+        vs.scroll_x = vs.scroll_x.max(0.0);
 
         // Text
         let gutter = ui.painter_at(Rect::from_min_max(rect.min, pos2(text_rect.left(), rect.bottom())));
         let text = ui.painter_at(text_rect);
-        let first = self.top.floor() as usize;
-        let frac = (self.top - first as f64) as f32;
-        let x0 = text_rect.left() - self.scroll_x;
+        let first = vs.top.floor() as usize;
+        let frac = (vs.top - first as f64) as f32;
+        let x0 = text_rect.left() - vs.scroll_x;
         let sel = self.selection();
         let cur_line = self.doc.line_of(self.cursor);
         let space = width(&ctx, font, b" ");
-        for i in 0..=self.rows + 1 {
+        for i in 0..=rows + 1 {
             let n = first + i;
             if n >= lines {
                 break;
@@ -723,10 +745,13 @@ impl Editor {
 
         // Scrollbar thumb, drawn last so it sits on top
         if lines > 1 {
-            let y = rect.top() + (self.top / max_top) as f32 * (rect.height() - thumb_h);
+            let y = rect.top() + (vs.top / max_top) as f32 * (rect.height() - thumb_h);
             let alpha = if bar.hovered() || bar.dragged() { 0.35 } else { 0.14 };
             let thumb = Rect::from_min_size(pos2(track.left() + 2.0, y), vec2(bar_w - 4.0, thumb_h));
             ui.painter().rect_filled(thumb, CornerRadius::same(4), fg.gamma_multiply(alpha));
+        }
+        if active {
+            (self.top, self.scroll_x) = (vs.top, vs.scroll_x);
         }
         resp.union(bar)
     }

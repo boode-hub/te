@@ -4,7 +4,7 @@ mod editor;
 mod search;
 mod tools;
 
-use editor::{Editor, Theme, View};
+use editor::{Editor, PaneView, Theme, View};
 use eframe::egui::{self, Align2, Color32, FontFamily, FontId, Frame, Key, Modifiers, Rect, RichText, Sense, TextEdit, Vec2, pos2, vec2};
 use eframe::egui_wgpu;
 use search::{Query, Search, Target};
@@ -306,10 +306,17 @@ fn item(ui: &mut egui::Ui, label: &str, keys: &str) -> bool {
     ui.add(egui::Button::new(label).shortcut_text(keys)).clicked()
 }
 
+/// Where the dividers sit, as fractions of the editor area: column edges (n-1 of them; the grid
+/// uses one), and the grid's row edge.
+fn equal_splits(n: usize) -> Vec<f32> {
+    if n == 4 { vec![0.5] } else { (1..n).map(|i| i as f32 / n as f32).collect() }
+}
+
 /// Splits `r` into `n` panes: side by side for 2–3, a 2×2 grid for 4.
-fn pane_rects(r: Rect, n: usize) -> Vec<Rect> {
+fn pane_rects(r: Rect, n: usize, xs: &[f32], y: f32) -> Vec<Rect> {
+    let x = |f: f32| r.left() + r.width() * f;
     if n == 4 {
-        let c = r.center();
+        let c = pos2(x(xs[0]), r.top() + r.height() * y);
         return vec![
             Rect::from_min_max(r.min, c),
             Rect::from_min_max(pos2(c.x, r.top()), pos2(r.right(), c.y)),
@@ -317,8 +324,10 @@ fn pane_rects(r: Rect, n: usize) -> Vec<Rect> {
             Rect::from_min_max(c, r.max),
         ];
     }
-    let w = r.width() / n as f32;
-    (0..n).map(|i| Rect::from_min_size(pos2(r.left() + w * i as f32, r.top()), vec2(w, r.height()))).collect()
+    let mut edges = vec![r.left()];
+    edges.extend(xs.iter().take(n - 1).map(|&f| x(f)));
+    edges.push(r.right());
+    edges.windows(2).map(|w| Rect::from_min_max(pos2(w[0], r.top()), pos2(w[1], r.bottom()))).collect()
 }
 
 fn pane_name(n: usize, p: usize) -> &'static str {
@@ -343,6 +352,10 @@ struct App {
     /// Which tab each pane shows (1–4 panes); `active` is the pane that gets the keyboard.
     panes: Vec<usize>,
     active: usize,
+    /// Scroll position of each (pane, tab id), so panes scroll independently, even on one file.
+    views: HashMap<(usize, u64), PaneView>,
+    splits: Vec<f32>,
+    split_y: f32,
     folder: Option<PathBuf>,
     tree_open: bool,
     dir_cache: HashMap<PathBuf, Vec<(String, PathBuf, bool)>>,
@@ -389,6 +402,9 @@ impl App {
             next_id: 1,
             panes: vec![0],
             active: 0,
+            views: HashMap::new(),
+            splits: Vec::new(),
+            split_y: 0.5,
             folder: None,
             tree_open: false,
             dir_cache: HashMap::new(),
@@ -469,16 +485,25 @@ impl App {
         if !self.tabs[i].confirm_discard() {
             return;
         }
-        self.tabs.remove(i);
-        if self.tabs.is_empty() {
-            self.tabs.push(Editor::new(self.next_id));
-            self.next_id += 1;
-        }
-        let last = self.tabs.len() - 1;
+        let id = self.tabs.remove(i).id;
+        self.views.retain(|(_, t), _| *t != id);
+        let showed: Vec<usize> = (0..self.panes.len()).filter(|&p| self.panes[p] == i).collect();
         for p in &mut self.panes {
-            if *p > i || *p > last {
+            if *p > i {
                 *p -= 1;
             }
+        }
+        // Panes that showed the closed tab get a tab not on screen yet, else a fresh empty one.
+        for p in showed {
+            let others: Vec<usize> = (0..self.panes.len()).filter(|&q| q != p).map(|q| self.panes[q]).collect();
+            self.panes[p] = match (0..self.tabs.len()).find(|t| !others.contains(t)) {
+                Some(t) => t,
+                None => {
+                    self.tabs.push(Editor::new(self.next_id));
+                    self.next_id += 1;
+                    self.tabs.len() - 1
+                }
+            };
         }
     }
 
@@ -498,6 +523,8 @@ impl App {
         }
         self.panes.truncate(n);
         self.active = self.active.min(n - 1);
+        self.splits = equal_splits(n);
+        self.split_y = 0.5;
     }
 
     fn cycle_tab(&mut self, back: bool) {
@@ -1166,7 +1193,11 @@ impl App {
         };
         let view = View { font: FontId::new(self.s.size, FontFamily::Name("user".into())), theme, gutter: self.s.gutter, spacing: self.s.spacing, highlight: hl.as_ref() };
         let n = self.panes.len();
-        let rects = pane_rects(ui.max_rect(), n);
+        let area = ui.max_rect();
+        if self.splits.len() != equal_splits(n).len() {
+            self.splits = equal_splits(n);
+        }
+        let rects = pane_rects(area, n, &self.splits, self.split_y);
         self.pane_rects = rects.clone();
         let dragging = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
         let drop_pane = if dragging && n > 1 { os_cursor(ui.ctx()).and_then(|c| rects.iter().position(|r| r.contains(c))) } else { None };
@@ -1185,7 +1216,9 @@ impl App {
                     child.painter().rect_filled(Rect::from_min_max(pos2(head.left(), head.bottom() - 2.0), head.right_bottom()), 0.0, fg.gamma_multiply(0.6));
                 }
             }
-            let resp = self.tabs[tab].draw(&mut child, &view, p == self.active);
+            let ed = &mut self.tabs[tab];
+            let vs = self.views.entry((p, ed.id)).or_insert(PaneView { top: ed.top, scroll_x: ed.scroll_x });
+            let resp = ed.draw(&mut child, &view, p == self.active, vs);
             // `clicked` too: a fast click can press and release within one frame.
             if (resp.is_pointer_button_down_on() || resp.clicked()) && self.active != p {
                 self.active = p;
@@ -1198,6 +1231,53 @@ impl App {
                 ui.painter().rect_stroke(r.shrink(2.0), 6.0, (2.0, fg), egui::StrokeKind::Inside);
                 ui.painter().text(r.center(), Align2::CENTER_CENTER, format!("Drop into {}", pane_name(n, p).to_lowercase()), FontId::proportional(18.0), fg);
             }
+        }
+        self.dividers(ui, area, n);
+    }
+
+    /// Drag a divider to resize the panes beside it; double-click one to make them equal again.
+    fn dividers(&mut self, ui: &mut egui::Ui, area: Rect, n: usize) {
+        if n < 2 {
+            return;
+        }
+        let fg = self.s.t.fg;
+        let mut reset = false;
+        let mut drag = |ui: &mut egui::Ui, id: &str, handle: Rect, line: [egui::Pos2; 2], horizontal: bool| -> Option<f32> {
+            let resp = ui.interact(handle, ui.scope_id().with(id), Sense::click_and_drag());
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(if horizontal { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::ResizeVertical });
+                ui.painter().line_segment(line, (2.0, fg.gamma_multiply(0.55)));
+            }
+            reset |= resp.double_clicked();
+            resp.dragged().then(|| resp.interact_pointer_pos()).flatten().map(|p| if horizontal { (p.x - area.left()) / area.width() } else { (p.y - area.top()) / area.height() })
+        };
+        let k_max = self.splits.len();
+        for k in 0..k_max {
+            let x = area.left() + area.width() * self.splits[k];
+            let handle = Rect::from_center_size(pos2(x, area.center().y), vec2(8.0, area.height()));
+            if let Some(f) = drag(ui, &format!("vsplit{k}"), handle, [pos2(x, area.top()), pos2(x, area.bottom())], true) {
+                // Keep every pane at least 120 points wide.
+                let m = 120.0 / area.width();
+                let lo = if k == 0 { 0.0 } else { self.splits[k - 1] } + m;
+                let hi = if k + 1 < k_max { self.splits[k + 1] } else { 1.0 } - m;
+                if lo < hi {
+                    self.splits[k] = f.clamp(lo, hi);
+                }
+            }
+        }
+        if n == 4 {
+            let y = area.top() + area.height() * self.split_y;
+            let handle = Rect::from_center_size(pos2(area.center().x, y), vec2(area.width(), 8.0));
+            if let Some(f) = drag(ui, "hsplit", handle, [pos2(area.left(), y), pos2(area.right(), y)], false) {
+                let m = 80.0 / area.height();
+                if m < 0.5 {
+                    self.split_y = f.clamp(m, 1.0 - m);
+                }
+            }
+        }
+        if reset {
+            self.splits = equal_splits(n);
+            self.split_y = 0.5;
         }
     }
 
@@ -1566,5 +1646,14 @@ mod tests {
 
         assert_eq!(palette().len(), 264);
         assert_eq!(pane_name(4, 3), "Bottom-right pane");
+
+        // Dividers: dragged fractions set each pane's width; the grid splits both ways.
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 600.0));
+        let w: Vec<f32> = pane_rects(area, 3, &[0.2, 0.9], 0.5).iter().map(|r| r.width()).collect();
+        assert_eq!(w, [200.0, 700.0, 100.0]);
+        let g = pane_rects(area, 4, &[0.25], 0.75);
+        assert_eq!((g[0].size(), g[3].size()), (vec2(250.0, 450.0), vec2(750.0, 150.0)));
+        assert_eq!(equal_splits(3), [1.0 / 3.0, 2.0 / 3.0]);
+        assert!(equal_splits(1).is_empty() && equal_splits(4) == [0.5]);
     }
 }
