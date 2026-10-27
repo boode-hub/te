@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod doc;
 mod editor;
-mod logo;
 mod search;
 mod tools;
 
@@ -27,6 +26,8 @@ const THEMES: &[(&str, &str, &str)] = &[
 ];
 const LAYOUTS: &[(&str, usize)] = &[("Single", 1), ("Two side by side", 2), ("Three side by side", 3), ("Grid of four", 4)];
 const RECENT_MAX: usize = 12;
+/// Itachi's Mangekyou Sharingan, rendered from assets/logo/itachi.svg by build.rs (128x128 RGBA).
+const LOGO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo_128.rgba"));
 
 struct Settings {
     font: String,
@@ -283,8 +284,8 @@ impl App {
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let logo = cc.egui_ctx.load_texture(
             "logo",
-            egui::ColorImage::from_rgba_unmultiplied([64, 64], &logo::rgba(64, [255, 255, 255])),
-            egui::TextureOptions::LINEAR,
+            egui::ColorImage::from_rgba_unmultiplied([128, 128], LOGO),
+            egui::TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..egui::TextureOptions::LINEAR },
         );
         let mut app = App {
             tabs: vec![Editor::new(0)],
@@ -592,7 +593,7 @@ impl App {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.add(egui::Image::new(&self.logo).fit_to_exact_size(vec2(18.0, 18.0)).tint(self.s.fg));
+            ui.add(egui::Image::new(&self.logo).fit_to_exact_size(vec2(20.0, 20.0)));
             ui.add_space(4.0);
             ui.menu_button("File", |ui| {
                 if item(ui, "New tab", "Ctrl+N") {
@@ -1256,7 +1257,7 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
-    let icon = egui::IconData { rgba: logo::rgba(64, [0x9f, 0xef, 0x00]), width: 64, height: 64 };
+    let icon = egui::IconData { rgba: LOGO.to_vec(), width: 128, height: 128 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("te")

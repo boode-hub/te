@@ -25,4 +25,5 @@ codegen-units = 1
 strip = true
 
 [build-dependencies]
+resvg = "0.45"
 winresource = "0.1"

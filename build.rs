@@ -1,15 +1,39 @@
-//! Embeds the Sharingan icon and version info in the Windows executable.
+//! Renders the Mangekyou Sharingan logo (assets/logo/itachi.svg) at build time: every icon size
+//! for the exe, plus a 128 px RGBA image the app uses for its window icon and top-bar logo.
 
-#[path = "src/logo.rs"]
-mod logo;
+use resvg::{tiny_skia, usvg};
+
+const SVG: &str = "assets/logo/itachi.svg";
+
+fn render(tree: &usvg::Tree, n: u32) -> tiny_skia::Pixmap {
+    let mut pm = tiny_skia::Pixmap::new(n, n).expect("pixmap");
+    let s = tree.size();
+    let k = n as f32 / s.width().max(s.height());
+    resvg::render(tree, tiny_skia::Transform::from_scale(k, k), &mut pm.as_mut());
+    pm
+}
 
 fn main() {
-    println!("cargo:rerun-if-changed=src/logo.rs");
+    println!("cargo:rerun-if-changed={SVG}");
+    let tree = usvg::Tree::from_data(&std::fs::read(SVG).expect("read logo"), &usvg::Options::default()).expect("parse logo");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+
+    // Straight (not premultiplied) RGBA, which is what egui's IconData and ColorImage expect.
+    let rgba: Vec<u8> = render(&tree, 128)
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let c = p.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect();
+    std::fs::write(out.join("logo_128.rgba"), rgba).expect("write logo");
+
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
         return;
     }
-    let ico = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("te.ico");
-    std::fs::write(&ico, ico_file(&[16, 24, 32, 48, 64, 128, 256])).expect("write icon");
+    let ico = out.join("te.ico");
+    std::fs::write(&ico, ico_file(&tree, &[16, 20, 24, 32, 40, 48, 64, 96, 128, 256])).expect("write icon");
     let mut res = winresource::WindowsResource::new();
     res.set_icon(ico.to_str().expect("utf-8 path"))
         .set("ProductName", "te")
@@ -20,14 +44,10 @@ fn main() {
     }
 }
 
-/// An .ico file with one PNG image per size.
-fn ico_file(sizes: &[usize]) -> Vec<u8> {
-    let pngs: Vec<Vec<u8>> = sizes
-        .iter()
-        .map(|&n| png(n, &logo::rgba(n, [0x9f, 0xef, 0x00])))
-        .collect();
-    let mut out = Vec::new();
-    out.extend_from_slice(&[0, 0, 1, 0]);
+/// An .ico file with one PNG image per size, each rendered from the vector at that exact size.
+fn ico_file(tree: &usvg::Tree, sizes: &[u32]) -> Vec<u8> {
+    let pngs: Vec<Vec<u8>> = sizes.iter().map(|&n| render(tree, n).encode_png().expect("png")).collect();
+    let mut out = vec![0, 0, 1, 0];
     out.extend_from_slice(&(sizes.len() as u16).to_le_bytes());
     let mut offset = 6 + 16 * sizes.len();
     for (n, data) in sizes.iter().zip(&pngs) {
@@ -40,58 +60,5 @@ fn ico_file(sizes: &[usize]) -> Vec<u8> {
     for d in pngs {
         out.extend_from_slice(&d);
     }
-    out
-}
-
-/// A minimal PNG encoder (stored deflate blocks) — enough for small icons.
-fn png(n: usize, rgba: &[u8]) -> Vec<u8> {
-    fn crc32(data: &[u8]) -> u32 {
-        let mut c = 0xFFFF_FFFFu32;
-        for &b in data {
-            c ^= b as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 {
-                    0xEDB8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-            }
-        }
-        !c
-    }
-    fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
-        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        let mut body = kind.to_vec();
-        body.extend_from_slice(data);
-        out.extend_from_slice(&body);
-        out.extend_from_slice(&crc32(&body).to_be_bytes());
-    }
-    let mut raw = Vec::with_capacity((n * 4 + 1) * n);
-    for row in rgba.chunks(n * 4) {
-        raw.push(0);
-        raw.extend_from_slice(row);
-    }
-    let mut z = vec![0x78, 0x01];
-    let blocks: Vec<&[u8]> = raw.chunks(65_535).collect();
-    for (i, b) in blocks.iter().enumerate() {
-        z.push(u8::from(i + 1 == blocks.len()));
-        z.extend_from_slice(&(b.len() as u16).to_le_bytes());
-        z.extend_from_slice(&(!(b.len() as u16)).to_le_bytes());
-        z.extend_from_slice(b);
-    }
-    let (mut a, mut b) = (1u32, 0u32);
-    for &x in &raw {
-        a = (a + x as u32) % 65_521;
-        b = (b + a) % 65_521;
-    }
-    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
-    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&(n as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(n as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-    chunk(&mut out, b"IHDR", &ihdr);
-    chunk(&mut out, b"IDAT", &z);
-    chunk(&mut out, b"IEND", &[]);
     out
 }

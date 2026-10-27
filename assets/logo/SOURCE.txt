@@ -1,0 +1,3 @@
+itachi.svg: Itachi's Mangekyou Sharingan, from D:\SS\4N-HQ\eyes (vector artwork of
+https://github.com/boode-hub/Sharingan-Monitor, MIT licence), as used by BDF.
+build.rs renders it into the exe icon and the in-app logo.

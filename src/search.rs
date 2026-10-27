@@ -218,3 +218,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Memory check: TE_BENCH=big.log cargo test --release memory -- --ignored --nocapture
+/// (sample the process's private bytes from outside while it runs).
+#[cfg(test)]
+#[test]
+#[ignore]
+fn memory() {
+    let path = PathBuf::from(std::env::var("TE_BENCH").unwrap());
+    let say = |m: &str| println!("[{:?}] {m}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100_000);
+    let docs: Vec<Doc> = (0..5).map(|_| doc::load(&path, &AtomicUsize::new(0)).unwrap()).collect();
+    say("5 docs open");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let tabs = docs.iter().enumerate().map(|(i, d)| (i as u64, format!("tab{i}"), d.clone())).collect();
+    let re = Query { text: "user_id".into(), case: true, ..Default::default() }.build().unwrap();
+    let t = std::time::Instant::now();
+    let s = start("mem".into(), re, tabs, None, vec![]);
+    while s.running() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    say(&format!("search done: {} hits in {:?}", s.results.lock().unwrap().iter().map(|f| f.hits.len()).sum::<usize>(), t.elapsed()));
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    drop(s);
+    drop(docs);
+    say("all dropped");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+}

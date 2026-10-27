@@ -689,3 +689,82 @@ impl Editor {
         resp.union(bar)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::Query;
+
+    fn text(e: &Editor) -> String {
+        String::from_utf8(e.doc.bytes(0..e.doc.len())).unwrap()
+    }
+
+    fn re(text: &str, regex: bool) -> Regex {
+        Query { text: text.into(), case: true, word: false, regex }.build().unwrap()
+    }
+
+    #[test]
+    fn edit_find_replace_tools_undo_save() {
+        let mut e = Editor::new(0);
+        e.doc.crlf = false;
+        e.insert(b"alpha beta\ngamma alpha\nalpha", false);
+
+        // find wraps around, and an empty regex match doesn't get stuck
+        e.cursor = 0;
+        e.anchor = None;
+        assert!(e.find_next(&re("alpha", false), true));
+        assert_eq!(e.selection(), Some(0..5));
+        assert!(e.find_next(&re("alpha", false), true));
+        assert_eq!(e.selection(), Some(17..22));
+        assert!(e.find_next(&re("^", true), true));
+        let first = e.cursor;
+        assert!(e.find_next(&re("^", true), true));
+        assert_ne!(e.cursor, first);
+
+        // replace one (only when the selection is a match), regex groups, replace all
+        e.jump(0..5);
+        e.replace_one(&re(r"(al)pha", true), "[$1]", true);
+        assert!(text(&e).starts_with("[al] beta"));
+        e.replace_all(&re("alpha", false), "$X", false);
+        assert_eq!(text(&e), "[al] beta\ngamma $X\n$X");
+        assert_eq!(e.msg.take().as_deref(), Some("Replaced 2"));
+
+        // tools run on the selection only, and each is one undo step
+        e.jump(0..4);
+        e.transform("b64", |b| Ok(b.iter().rev().copied().collect()));
+        assert_eq!(text(&e), "]la[ beta\ngamma $X\n$X");
+        e.undo_redo(false);
+        assert_eq!(text(&e), "[al] beta\ngamma $X\n$X");
+        e.undo_redo(true);
+        assert_eq!(text(&e), "]la[ beta\ngamma $X\n$X");
+        e.transform("fail", |_| Err("nope".into()));
+        assert_eq!(e.msg.take().as_deref(), Some("fail: nope"));
+
+        // line tools
+        e.anchor = None;
+        e.cursor = 12; // inside "gamma"
+        e.duplicate_line();
+        assert_eq!(text(&e), "]la[ beta\ngamma $X\ngamma $X\n$X");
+        e.delete_line();
+        e.delete_line();
+        assert_eq!(text(&e), "]la[ beta\ngamma $X"); // the second delete took the last line
+        e.set_line_endings(true);
+        assert_eq!(text(&e), "]la[ beta\r\ngamma $X");
+        assert!(e.doc.crlf);
+
+        // save goes through a temp file, reopens, and keeps the selection
+        let path = std::env::temp_dir().join("te_editor_test.txt");
+        std::fs::write(&path, "old").unwrap();
+        e.path = Some(path.clone());
+        e.jump(0..4);
+        assert!(e.save(false));
+        while e.poll().is_none() {
+            std::thread::yield_now();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "]la[ beta\r\ngamma $X");
+        assert!(!e.modified && !path.with_extension("txt.te-tmp").exists());
+        assert_eq!(e.selection(), Some(0..4));
+        assert_eq!(text(&e), "]la[ beta\r\ngamma $X");
+        let _ = std::fs::remove_file(&path);
+    }
+}
