@@ -41,6 +41,7 @@ struct Settings {
     gutter: bool,
     spacing: f32,
     recent: Vec<String>,
+    custom: [u32; 16],
 }
 
 impl Settings {
@@ -58,6 +59,7 @@ impl Settings {
             gutter: true,
             spacing: 1.25,
             recent: Vec::new(),
+            custom: [0xFFFFFF; 16],
         }
     }
 
@@ -80,6 +82,11 @@ impl Settings {
                 "gutter" => self.gutter = v == "1",
                 "spacing" => self.spacing = v.parse().unwrap_or(self.spacing),
                 "recent" if recent.len() < RECENT_MAX => recent.push(v.to_string()),
+                "custom" => {
+                    for (slot, hex) in self.custom.iter_mut().zip(v.split(',')) {
+                        *slot = u32::from_str_radix(hex, 16).unwrap_or(*slot);
+                    }
+                }
                 k => {
                     if let Ok(c) = Color32::from_hex(v) {
                         colors.insert(k.to_string(), c);
@@ -115,6 +122,7 @@ impl Settings {
 
     fn serialize(&self) -> String {
         let mut out = self.style();
+        out += &format!("custom={}\n", self.custom.map(|c| format!("{c:06x}")).join(","));
         for r in &self.recent {
             out += &format!("recent={r}\n");
         }
@@ -138,18 +146,48 @@ fn list_profiles() -> Vec<String> {
     v
 }
 
-/// The palette: 24 hues × 10 shades plus a row of greys (264 colours).
-fn palette() -> Vec<Color32> {
-    const SHADES: [(f32, f32); 10] = [(0.15, 1.0), (0.3, 1.0), (0.5, 1.0), (0.75, 1.0), (1.0, 1.0), (1.0, 0.82), (1.0, 0.64), (1.0, 0.46), (0.9, 0.3), (0.7, 0.16)];
-    let mut out = Vec::with_capacity(264);
-    for (s, v) in SHADES {
-        out.extend((0..24).map(|h| Color32::from(egui::ecolor::Hsva::new(h as f32 / 24.0, s, v, 1.0))));
+/// The standard Windows colour dialog, fully open. Keeps `current`'s transparency; `custom` holds
+/// the dialog's 16 custom colours (remembered in te.cfg).
+fn pick_color(current: Color32, custom: &mut [u32; 16]) -> Option<Color32> {
+    #[repr(C)]
+    struct ChooseColor {
+        size: u32,
+        owner: isize,
+        instance: isize,
+        result: u32,
+        custom: *mut u32,
+        flags: u32,
+        data: isize,
+        hook: usize,
+        template: *const u16,
     }
-    out.extend((0..24).map(|i| {
-        let g = (255.0 * (1.0 - i as f32 / 23.0)) as u8;
-        Color32::from_rgb(g, g, g)
-    }));
-    out
+    #[link(name = "comdlg32")]
+    unsafe extern "system" {
+        fn ChooseColorW(cc: *mut ChooseColor) -> i32;
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetActiveWindow() -> isize;
+    }
+    let [r, g, b, a] = current.to_srgba_unmultiplied();
+    let mut cc = ChooseColor {
+        size: std::mem::size_of::<ChooseColor>() as u32,
+        // SAFETY: plain Win32 call with no arguments.
+        owner: unsafe { GetActiveWindow() },
+        instance: 0,
+        result: r as u32 | (g as u32) << 8 | (b as u32) << 16,
+        custom: custom.as_mut_ptr(),
+        flags: 0x1 | 0x2, // CC_RGBINIT | CC_FULLOPEN
+        data: 0,
+        hook: 0,
+        template: std::ptr::null(),
+    };
+    // SAFETY: `cc` is a valid CHOOSECOLORW and `custom` (16 COLORREFs) outlives the call.
+    if unsafe { ChooseColorW(&mut cc) } == 0 {
+        return None;
+    }
+    let c = cc.result;
+    Some(Color32::from_rgba_unmultiplied(c as u8, (c >> 8) as u8, (c >> 16) as u8, a))
 }
 
 /// Where the mouse is in this window right now, asked of Windows directly: winit reports
@@ -378,8 +416,8 @@ struct App {
     /// Last frame's pane rectangles, to find which pane a file was dropped on.
     pane_rects: Vec<Rect>,
     look_tab: usize,
-    paint_slot: usize,
-    palette: Vec<Color32>,
+    /// Each split pane's own quick search text.
+    pane_find: Vec<String>,
     profiles: Option<Vec<String>>,
     profile_name: String,
     status: String,
@@ -426,8 +464,7 @@ impl App {
             visuals_for: None,
             pane_rects: Vec::new(),
             look_tab: 0,
-            paint_slot: 0,
-            palette: palette(),
+            pane_find: Vec::new(),
             profiles: None,
             profile_name: String::new(),
             status: String::new(),
@@ -1191,8 +1228,9 @@ impl App {
         } else {
             None
         };
-        let view = View { font: FontId::new(self.s.size, FontFamily::Name("user".into())), theme, gutter: self.s.gutter, spacing: self.s.spacing, highlight: hl.as_ref() };
+        let font = FontId::new(self.s.size, FontFamily::Name("user".into()));
         let n = self.panes.len();
+        self.pane_find.resize(n, String::new());
         let area = ui.max_rect();
         if self.splits.len() != equal_splits(n).len() {
             self.splits = equal_splits(n);
@@ -1207,15 +1245,12 @@ impl App {
         for (p, r) in rects.into_iter().enumerate() {
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r.shrink(if n > 1 { 1.0 } else { 0.0 })).id_salt(("pane", p)));
             let tab = self.panes[p];
-            if n > 1 {
-                let (head, _) = child.allocate_exact_size(vec2(child.available_width(), 22.0), Sense::hover());
-                let active = p == self.active;
-                let t = &self.tabs[tab];
-                child.painter().text(head.left_center() + vec2(10.0, 0.0), Align2::LEFT_CENTER, format!("{}{}", t.name(), if t.modified { " •" } else { "" }), FontId::proportional(12.0), if active { fg } else { fg.gamma_multiply(0.5) });
-                if active {
-                    child.painter().rect_filled(Rect::from_min_max(pos2(head.left(), head.bottom() - 2.0), head.right_bottom()), 0.0, fg.gamma_multiply(0.6));
-                }
+            if n > 1 && self.pane_header(&mut child, p, tab) {
+                self.active = p;
             }
+            // A pane's own quick search wins over the main find bar's highlight.
+            let pane_re = Query { text: self.pane_find[p].clone(), ..Default::default() }.build().ok();
+            let view = View { font: font.clone(), theme, gutter: self.s.gutter, spacing: self.s.spacing, highlight: pane_re.as_ref().or(hl.as_ref()) };
             let ed = &mut self.tabs[tab];
             let vs = self.views.entry((p, ed.id)).or_insert(PaneView { top: ed.top, scroll_x: ed.scroll_x });
             let resp = ed.draw(&mut child, &view, p == self.active, vs);
@@ -1233,6 +1268,52 @@ impl App {
             }
         }
         self.dividers(ui, area, n);
+    }
+
+    /// A split pane's header: its file name and its own quick search (separate from the main find
+    /// bar; case-insensitive, Enter / Shift+Enter or the arrows step through matches).
+    /// Returns true when the pane should become the active one.
+    fn pane_header(&mut self, ui: &mut egui::Ui, p: usize, tab: usize) -> bool {
+        let (fg, active) = (self.s.t.fg, p == self.active);
+        let (mut step, mut activate) = (None, false);
+        let w = ui.available_width();
+        let head = ui
+            .allocate_ui_with_layout(vec2(w, 26.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                let t = &self.tabs[tab];
+                let name = format!("{}{}", t.name(), if t.modified { " •" } else { "" });
+                ui.label(RichText::new(name).size(12.0).color(if active { fg } else { fg.gamma_multiply(0.5) }));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    if ui.small_button(">").on_hover_text("Next match in this pane (Enter)").clicked() {
+                        step = Some(true);
+                    }
+                    if ui.small_button("<").on_hover_text("Previous match in this pane (Shift+Enter)").clicked() {
+                        step = Some(false);
+                    }
+                    let r = ui.add(TextEdit::singleline(&mut self.pane_find[p]).hint_text("Search this pane").desired_width((w * 0.4).clamp(80.0, 240.0)));
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        step = Some(!ui.input(|i| i.modifiers.shift));
+                        r.request_focus();
+                    }
+                    activate |= r.has_focus();
+                });
+            })
+            .response
+            .rect;
+        if active {
+            ui.painter().rect_filled(Rect::from_min_max(pos2(head.left(), head.bottom() - 2.0), head.right_bottom()), 0.0, fg.gamma_multiply(0.6));
+        }
+        if let Some(forward) = step {
+            match (Query { text: self.pane_find[p].clone(), ..Default::default() }).build() {
+                Ok(re) => {
+                    self.tabs[tab].find_next(&re, forward);
+                }
+                Err(e) => self.status = e,
+            }
+            activate = true;
+        }
+        activate
     }
 
     /// Drag a divider to resize the panes beside it; double-click one to make them equal again.
@@ -1342,43 +1423,30 @@ impl App {
             }
         });
         ui.add_space(4.0);
-        ui.label(RichText::new("Your theme: pick a part, then click a colour below. The swatch next to each part opens an exact colour picker.").size(11.0).color(dim));
-        let mut paint = self.paint_slot;
-        egui::Grid::new("slots").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
+        ui.label(RichText::new("Click a colour to change it").size(11.0).color(dim));
+        let (bg, fg) = (self.s.t.bg, self.s.t.fg);
+        let mut pick = None;
+        egui::Grid::new("slots").num_columns(4).spacing([10.0, 8.0]).show(ui, |ui| {
             for (i, (label, _, c)) in self.s.t.slots().into_iter().enumerate() {
-                ui.color_edit_button_srgba(c);
-                if ui.selectable_label(paint == i, label).clicked() {
-                    paint = i;
+                let (r, resp) = ui.allocate_exact_size(vec2(44.0, 20.0), Sense::click());
+                // Painted over the background so see-through parts look as they will in the editor.
+                ui.painter().rect_filled(r, 4.0, bg);
+                ui.painter().rect_filled(r, 4.0, *c);
+                ui.painter().rect_stroke(r, 4.0, (1.0, fg.gamma_multiply(if resp.hovered() { 0.9 } else { 0.35 })), egui::StrokeKind::Inside);
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    pick = Some(i);
                 }
+                ui.label(label);
                 if i % 2 == 1 {
                     ui.end_row();
                 }
             }
         });
-        self.paint_slot = paint;
-        ui.add_space(4.0);
-        let fg = self.s.t.fg;
-        let mut picked = None;
-        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
-        for row in self.palette.chunks(24) {
-            ui.horizontal(|ui| {
-                for &c in row {
-                    let (r, resp) = ui.allocate_exact_size(vec2(19.0, 19.0), Sense::click());
-                    ui.painter().rect_filled(r, 3.0, c);
-                    if resp.hovered() {
-                        ui.painter().rect_stroke(r.expand(1.0), 3.0, (2.0, fg), egui::StrokeKind::Outside);
-                    }
-                    if resp.on_hover_text(c.to_hex()).clicked() {
-                        picked = Some(c);
-                    }
-                }
-            });
-        }
-        if let Some(c) = picked
-            && let Some((_, _, target)) = self.s.t.slots().into_iter().nth(self.paint_slot)
+        if let Some(i) = pick
+            && let Some((_, _, c)) = self.s.t.slots().into_iter().nth(i)
+            && let Some(new) = pick_color(*c, &mut self.s.custom)
         {
-            // Translucent parts (selection, current line, matches) keep their transparency.
-            *target = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), target.a());
+            *c = new;
         }
     }
 
@@ -1626,7 +1694,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_profiles_and_palette() {
+    fn settings_and_profiles() {
         // An old te.cfg with only bg/fg gets the other colours derived from them.
         let mut s = Settings::default();
         s.apply("bg=#102030ff\nfg=#e0e0e0ff\nsize=18\nrecent=C:/a.txt\n");
@@ -1644,7 +1712,12 @@ mod tests {
         other.apply(&profile);
         assert!(other.t == s.t && other.font == "Orbitron" && other.recent == ["keep"]);
 
-        assert_eq!(palette().len(), 264);
+        // The colour dialog's custom colours survive a save and reload of te.cfg.
+        s.custom[3] = 0x00ff8800;
+        let mut back = Settings::default();
+        back.apply(&s.serialize());
+        assert_eq!(back.custom[3], 0x00ff8800);
+
         assert_eq!(pane_name(4, 3), "Bottom-right pane");
 
         // Dividers: dragged fractions set each pane's width; the grid splits both ways.

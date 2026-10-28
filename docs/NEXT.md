@@ -25,13 +25,17 @@ State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites
   panes scrolls separately; panes remember their place per tab. Draggable dividers resize panes
   (min 120 pt wide / 80 pt tall), double-click a divider to equalise; closing a tab never leaves one
   file in two panes
-- Appearance window: Colours / Font & size / Profiles tabs, Reset to defaults; 8 mappable theme parts
-  (background, text, cursor, selection, current line, line numbers, search matches, bars) painted from a
-  264-colour palette or an exact picker; profiles saved as profiles/<name>.cfg next to te.exe
+- Appearance window: Colours / Font & size / Profiles tabs, Reset to defaults; 8 theme parts
+  (background, text, cursor, selection, current line, line numbers, search matches, bars), each a
+  swatch that opens the standard Windows colour dialog (custom colours remembered in te.cfg);
+  profiles saved as profiles/<name>.cfg next to te.exe
+- Per-pane quick search: in split view each pane header has its own search box (< > / Enter /
+  Shift+Enter, case-insensitive), separate from the main find bar, highlighting only in that pane
 - GUI checked by hand: tabs, HTML + JSON pretty print, split view, search across tabs, folder panel, logo
 
 ## Open (pick up here)
-1. GUI-test by hand (not automatable while someone uses the PC): divider dragging, independent scroll
+1. GUI-test by hand (not automatable while someone uses the PC): per-pane search, the colour dialog,
+   divider dragging, independent scroll
    on one file in two panes, a real drag-and-drop onto each pane,
    profile Load/Delete, 4-pane grid, folder search result in an unopened file, encode/decode + hash
    from menus, Save as / Save all, unsaved-changes prompts.
