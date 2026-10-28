@@ -30,6 +30,9 @@ pub struct Piece {
     start: usize,
     len: usize,
     nl: usize,
+    /// For original-file pieces: newlines in the file before `start`, so finding a line inside
+    /// the piece scans one 64 KiB chunk instead of two.
+    base: usize,
 }
 
 /// Files smaller than this are read into memory and the file is closed at once, so te never
@@ -63,6 +66,13 @@ pub struct Doc {
     index: Arc<Vec<usize>>,
     add: Arc<Vec<u8>>,
     pieces: Vec<Piece>,
+    /// Totals over `pieces`, kept up to date so length and line count are O(1) (asked many
+    /// times a frame).
+    len: usize,
+    nl: usize,
+    /// (byte offset, newlines before) at the start of each piece, plus a final (len, nl), so
+    /// lookups binary-search instead of walking every piece. Rebuilt lazily after an edit.
+    starts: std::cell::OnceCell<Vec<(usize, usize)>>,
     pub crlf: bool,
 }
 
@@ -142,13 +152,14 @@ pub fn load(path: &Path, done: &AtomicUsize) -> io::Result<Doc> {
 
 impl Doc {
     pub fn new() -> Doc {
-        Doc { orig: None, index: Arc::new(vec![0]), add: Arc::default(), pieces: Vec::new(), crlf: cfg!(windows) }
+        Doc { orig: None, index: Arc::new(vec![0]), add: Arc::default(), pieces: Vec::new(), len: 0, nl: 0, starts: Default::default(), crlf: cfg!(windows) }
     }
 
     fn from_map(map: Orig, index: Vec<usize>) -> Doc {
         let crlf = memchr::memmem::find(&map[..map.len().min(CHUNK)], b"\r\n").is_some();
-        let pieces = vec![Piece { src: Src::Orig, start: 0, len: map.len(), nl: *index.last().unwrap() }];
-        Doc { orig: Some(Arc::new(map)), index: Arc::new(index), add: Arc::default(), pieces, crlf }
+        let (len, nl) = (map.len(), *index.last().unwrap());
+        let pieces = vec![Piece { src: Src::Orig, start: 0, len, nl, base: 0 }];
+        Doc { orig: Some(Arc::new(map)), index: Arc::new(index), add: Arc::default(), pieces, len, nl, starts: Default::default(), crlf }
     }
 
     fn orig(&self) -> &[u8] {
@@ -167,11 +178,11 @@ impl Doc {
     }
 
     pub fn len(&self) -> usize {
-        self.pieces.iter().map(|p| p.len).sum()
+        self.len
     }
 
     pub fn line_count(&self) -> usize {
-        self.pieces.iter().map(|p| p.nl).sum::<usize>() + 1
+        self.nl + 1
     }
 
     /// Newlines in orig before byte `off`.
@@ -188,17 +199,38 @@ impl Doc {
         start + memchr_iter(b'\n', &self.orig()[start..end]).nth(k - self.index[c] - 1).unwrap()
     }
 
-    fn nl_in(&self, src: Src, start: usize, len: usize) -> usize {
-        match src {
-            Src::Orig => self.orig_nl_before(start + len) - self.orig_nl_before(start),
-            Src::Add => count_nl(&self.add[start..start + len]),
+    /// Newlines in the first `k` bytes of piece `p`.
+    fn nl_in(&self, p: &Piece, k: usize) -> usize {
+        match p.src {
+            Src::Orig => self.orig_nl_before(p.start + k) - p.base,
+            Src::Add => count_nl(&self.add[p.start..p.start + k]),
         }
     }
 
+    fn starts(&self) -> &[(usize, usize)] {
+        self.starts.get_or_init(|| {
+            let mut v = Vec::with_capacity(self.pieces.len() + 1);
+            let (mut pos, mut nl) = (0, 0);
+            for p in &self.pieces {
+                v.push((pos, nl));
+                pos += p.len;
+                nl += p.nl;
+            }
+            v.push((pos, nl));
+            v
+        })
+    }
+
+    /// Index of the piece containing byte `off` (pieces.len() if `off` is at or past the end).
+    fn piece_at(&self, off: usize) -> usize {
+        self.starts().partition_point(|&(o, _)| o <= off).saturating_sub(1).min(self.pieces.len())
+    }
+
     pub fn bytes(&self, r: Range<usize>) -> Vec<u8> {
-        let mut out = Vec::with_capacity(r.len());
-        let mut pos = 0;
-        for p in &self.pieces {
+        let mut out = Vec::with_capacity(r.len().min(self.len.saturating_sub(r.start)));
+        let first = self.piece_at(r.start);
+        let mut pos = self.starts()[first].0;
+        for p in &self.pieces[first..] {
             let (ps, pe) = (pos, pos + p.len);
             pos = pe;
             if pe <= r.start {
@@ -216,19 +248,18 @@ impl Doc {
         if n == 0 {
             return 0;
         }
-        let (mut rem, mut pos) = (n, 0);
-        for p in &self.pieces {
-            if p.nl >= rem {
-                let k = match p.src {
-                    Src::Orig => self.orig_nth_nl(self.orig_nl_before(p.start) + rem) - p.start,
-                    Src::Add => memchr_iter(b'\n', self.slice(p)).nth(rem - 1).unwrap(),
-                };
-                return pos + k + 1;
-            }
-            rem -= p.nl;
-            pos += p.len;
+        if n > self.nl {
+            return self.len;
         }
-        pos
+        // The piece holding the n-th newline: the last one with fewer than n newlines before it.
+        let i = self.starts().partition_point(|&(_, nl)| nl < n) - 1;
+        let (pos, before) = self.starts()[i];
+        let (p, rem) = (&self.pieces[i], n - before);
+        let k = match p.src {
+            Src::Orig => self.orig_nth_nl(p.base + rem) - p.start,
+            Src::Add => memchr_iter(b'\n', self.slice(p)).nth(rem - 1).unwrap(),
+        };
+        pos + k + 1
     }
 
     /// End of line n, before its "\n" or "\r\n".
@@ -237,19 +268,17 @@ impl Doc {
             return self.len();
         }
         let e = self.line_start(n + 1) - 1;
-        if e > self.line_start(n) && self.bytes(e - 1..e) == b"\r" { e - 1 } else { e }
+        if e > 0 && self.bytes(e - 1..e) == b"\r" && e - 1 >= self.line_start(n) { e - 1 } else { e }
     }
 
     pub fn line_of(&self, off: usize) -> usize {
-        let (mut line, mut pos) = (0, 0);
-        for p in &self.pieces {
-            if off < pos + p.len {
-                return line + self.nl_in(p.src, p.start, off - pos);
-            }
-            line += p.nl;
-            pos += p.len;
+        if off >= self.len {
+            return self.nl;
         }
-        line
+        let i = self.piece_at(off);
+        let (pos, line) = self.starts()[i];
+        let p = &self.pieces[i];
+        line + self.nl_in(p, off - pos)
     }
 
     pub fn next_char(&self, at: usize) -> usize {
@@ -283,6 +312,7 @@ impl Doc {
 
     /// Make sure a piece boundary exists at `at`; returns the index of the piece starting there.
     fn split(&mut self, at: usize) -> usize {
+        self.starts.take();
         let mut pos = 0;
         for i in 0..self.pieces.len() {
             let p = self.pieces[i];
@@ -291,9 +321,9 @@ impl Doc {
             }
             if at < pos + p.len {
                 let k = at - pos;
-                let nl = self.nl_in(p.src, p.start, k);
+                let nl = self.nl_in(&p, k);
                 self.pieces[i] = Piece { len: k, nl, ..p };
-                self.pieces.insert(i + 1, Piece { start: p.start + k, len: p.len - k, nl: p.nl - nl, ..p });
+                self.pieces.insert(i + 1, Piece { start: p.start + k, len: p.len - k, nl: p.nl - nl, base: p.base + nl, ..p });
                 return i + 1;
             }
             pos += p.len;
@@ -310,6 +340,9 @@ impl Doc {
         let start = add.len();
         add.extend_from_slice(text);
         let nl = count_nl(text);
+        self.starts.take();
+        self.len += text.len();
+        self.nl += nl;
         // Typing appends to the add buffer contiguously; grow the last piece instead of adding one.
         if i > 0 {
             let q = &mut self.pieces[i - 1];
@@ -319,7 +352,7 @@ impl Doc {
                 return;
             }
         }
-        self.pieces.insert(i, Piece { src: Src::Add, start, len: text.len(), nl });
+        self.pieces.insert(i, Piece { src: Src::Add, start, len: text.len(), nl, base: 0 });
     }
 
     pub fn delete(&mut self, r: Range<usize>) {
@@ -328,7 +361,10 @@ impl Doc {
         }
         let i = self.split(r.start);
         let j = self.split(r.end);
-        self.pieces.drain(i..j);
+        for p in self.pieces.drain(i..j) {
+            self.len -= p.len;
+            self.nl -= p.nl;
+        }
     }
 
     pub fn snapshot(&self) -> Vec<Piece> {
@@ -336,26 +372,33 @@ impl Doc {
     }
 
     pub fn restore(&mut self, pieces: Vec<Piece>) {
+        self.starts.take();
+        self.len = pieces.iter().map(|p| p.len).sum();
+        self.nl = pieces.iter().map(|p| p.nl).sum();
         self.pieces = pieces;
     }
 
-    /// Calls `f` for each regex match at or after `from`, in order, until it returns false.
+    /// Calls `f` for each regex match starting inside `r`, in order, until it returns false.
     /// Reads 8 MiB blocks, so memory stays flat on any file size. Each block also sees a little
     /// text before it, so `^`, `\b` and look-behind behave as if the whole file were searched.
     // ponytail: one match longer than OVERLAP straddling a block edge is cut short; raise OVERLAP if it bites.
-    pub fn scan(&self, re: &Regex, from: usize, mut f: impl FnMut(Range<usize>) -> bool) {
+    pub fn scan(&self, re: &Regex, r: Range<usize>, mut f: impl FnMut(Range<usize>) -> bool) {
         let len = self.len();
-        let (mut s, mut next) = (from.min(len), from.min(len));
+        let end = r.end.min(len);
+        let (mut s, mut next) = (r.start.min(end), r.start.min(end));
         loop {
-            let e = (s + BLOCK).min(len);
+            let e = (s + BLOCK).min(end);
             let b0 = s.saturating_sub(CONTEXT);
             let buf = self.bytes(b0..(e + OVERLAP).min(len));
             let mut at = next.max(s) - b0;
             while at <= buf.len() {
                 let Some(m) = re.find_at(&buf, at) else { break };
                 let (ms, me) = (b0 + m.start(), b0 + m.end());
-                if ms >= e && e < len {
-                    break; // the next block owns it
+                if ms >= e {
+                    if e < end {
+                        break; // the next block owns it
+                    }
+                    return;
                 }
                 if !f(ms..me) {
                     return;
@@ -363,7 +406,7 @@ impl Doc {
                 next = if me > ms { me } else { me + 1 };
                 at = next - b0;
             }
-            if e >= len {
+            if e >= end {
                 return;
             }
             s = e;
@@ -372,18 +415,24 @@ impl Doc {
 
     /// First match at or after `from` (forward) or the last one starting before `from` (backward).
     pub fn find(&self, re: &Regex, from: usize, forward: bool) -> Option<Range<usize>> {
+        if forward { self.find_in(re, from..self.len(), true) } else { self.find_in(re, 0..from, false) }
+    }
+
+    /// First (forward) or last (backward) match starting inside `r`.
+    pub fn find_in(&self, re: &Regex, r: Range<usize>, forward: bool) -> Option<Range<usize>> {
         if forward {
             let mut hit = None;
-            self.scan(re, from, |r| {
-                hit = Some(r);
+            self.scan(re, r, |m| {
+                hit = Some(m);
                 false
             });
             return hit;
         }
         let len = self.len();
-        let mut e = from.min(len);
-        while e > 0 {
-            let s = e.saturating_sub(BLOCK);
+        let lo = r.start.min(len);
+        let mut e = r.end.min(len);
+        while e > lo {
+            let s = e.saturating_sub(BLOCK).max(lo);
             let b0 = s.saturating_sub(CONTEXT);
             let buf = self.bytes(b0..(e + OVERLAP).min(len));
             let (mut last, mut at) = (None, s - b0);
@@ -444,6 +493,13 @@ mod tests {
             for _ in 0..50 {
                 let n = rnd(starts.len());
                 assert_eq!(doc.line_start(n), starts[n]);
+                let end = if n + 1 < starts.len() {
+                    let e = starts[n + 1] - 1;
+                    if e > starts[n] && model[e - 1] == b'\r' { e - 1 } else { e }
+                } else {
+                    model.len()
+                };
+                assert_eq!(doc.line_end(n), end);
                 let off = rnd(model.len());
                 assert_eq!(doc.line_of(off), starts.partition_point(|&s| s <= off) - 1);
             }
@@ -466,7 +522,7 @@ mod tests {
             check(&doc, &model, &mut rnd);
             if round % 50 == 0 {
                 let mut all = Vec::new();
-                doc.scan(&re, 0, |r| {
+                doc.scan(&re, 0..doc.len(), |r| {
                     all.push(r.start);
                     true
                 });
@@ -477,7 +533,7 @@ mod tests {
         // Anchors and word boundaries see the text before a block edge.
         let line = Regex::new(r"(?m)^hello").unwrap();
         let mut n = 0;
-        doc.scan(&line, 0, |_| {
+        doc.scan(&line, 0..doc.len(), |_| {
             n += 1;
             true
         });
@@ -486,11 +542,20 @@ mod tests {
         // Empty matches advance instead of looping forever.
         let small = load(&path, &AtomicUsize::new(0)).unwrap();
         let mut empties = 0;
-        small.scan(&Regex::new("").unwrap(), small.len() - 3, |_| {
+        small.scan(&Regex::new("").unwrap(), small.len() - 3..small.len(), |_| {
             empties += 1;
             true
         });
-        assert_eq!(empties, 4);
+        assert_eq!(empties, 3);
+        // Bounded searches stay inside their range.
+        let z = Regex::new("zzQ").unwrap();
+        let all: Vec<usize> = memmem::find_iter(&model, b"zzQ").collect();
+        if all.len() >= 3 {
+            let (a, b) = (all[0], all[all.len() - 1]);
+            assert_eq!(doc.find_in(&z, a + 1..b, true).map(|m| m.start), Some(all[1]));
+            assert_eq!(doc.find_in(&z, a + 1..b, false).map(|m| m.start), Some(all[all.len() - 2]));
+            assert_eq!(doc.find_in(&z, a + 1..a + 2, true), None);
+        }
 
         // Small files are read, not mapped, so other programs can still replace them while open.
         assert!(!small.is_mapped() && !doc.is_mapped());
@@ -530,11 +595,44 @@ mod tests {
             let re = Regex::new(pat).unwrap();
             let t = std::time::Instant::now();
             let mut n = 0usize;
-            doc.scan(&re, 0, |_| {
+            doc.scan(&re, 0..doc.len(), |_| {
                 n += 1;
                 true
             });
             println!("scan {pat:?}: {n} matches in {:?}", t.elapsed());
         }
+
+        // Worst case for the piece table: thousands of scattered edits, then draw a screenful.
+        let mut d = doc.clone();
+        let t = std::time::Instant::now();
+        for i in 0..20_000usize {
+            d.insert(i.wrapping_mul(7_919_993) % d.len(), b"x");
+        }
+        println!("20k scattered inserts: {:?} ({} pieces)", t.elapsed(), d.pieces.len());
+        let t = std::time::Instant::now();
+        let top = d.line_count() / 2;
+        for n in top..top + 60 {
+            let s = d.line_start(n);
+            let _ = d.bytes(s..d.line_end(n));
+            let _ = d.line_of(s);
+        }
+        println!("one screen (60 lines) with {} pieces: {:?}", d.pieces.len(), t.elapsed());
+
+        // A 100 MB file that is one single line (minified JSON style).
+        let one = std::env::temp_dir().join("te_one_line.txt");
+        std::fs::write(&one, vec![b'a'; 100 << 20]).unwrap();
+        let t = std::time::Instant::now();
+        let o = load(&one, &AtomicUsize::new(0)).unwrap();
+        println!("one-line 100 MB: open {:?}, mapped={}", t.elapsed(), o.is_mapped());
+        let t = std::time::Instant::now();
+        let (s, e) = (o.line_start(0), o.line_end(0));
+        let _ = o.bytes(s..e.min(s + 20_000));
+        let _ = (o.line_of(o.len() - 1), o.next_char(o.len() / 2), o.prev_char(o.len() / 2));
+        println!("one-line: draw-path calls {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let miss = o.find(&Regex::new("aab").unwrap(), 0, true);
+        println!("one-line: search miss over 100 MB {:?} ({miss:?})", t.elapsed());
+        drop(o);
+        let _ = std::fs::remove_file(&one);
     }
 }

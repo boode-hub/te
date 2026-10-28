@@ -752,10 +752,8 @@ impl App {
         if k(cmd, Key::Comma) {
             self.settings_open = !self.settings_open;
         }
-        if k(none, Key::Escape) {
-            if self.goto.take().is_none() && !std::mem::take(&mut self.find_open) {
-                self.settings_open = false;
-            }
+        if k(none, Key::Escape) && self.goto.take().is_none() && !std::mem::take(&mut self.find_open) {
+            self.settings_open = false;
         }
         let zoom = ctx.input(|i| i.zoom_delta());
         if zoom != 1.0 {

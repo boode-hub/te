@@ -126,7 +126,7 @@ fn url_decode(b: &[u8]) -> Result<Vec<u8>, String> {
     let mut i = 0;
     while i < b.len() {
         match b[i] {
-            b'%' if i + 2 < b.len() + 0 && b.len() > i + 2 => match u8::from_str_radix(&String::from_utf8_lossy(&b[i + 1..i + 3]), 16) {
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(&String::from_utf8_lossy(&b[i + 1..i + 3]), 16) {
                 Ok(v) => {
                     out.push(v);
                     i += 3;
@@ -287,7 +287,7 @@ fn binary_decode(b: &[u8]) -> Result<Vec<u8>, String> {
     if let Some(c) = bits.iter().find(|&&c| c != b'0' && c != b'1') {
         return Err(format!("not binary: unexpected {:?}", *c as char));
     }
-    if bits.len() % 8 != 0 {
+    if !bits.len().is_multiple_of(8) {
         return Err("bit count is not a multiple of 8".into());
     }
     Ok(bits.chunks(8).map(|g| g.iter().fold(0, |n, &c| n << 1 | (c - b'0'))).collect())
@@ -351,7 +351,9 @@ fn crc32(b: &[u8]) -> String {
     format!("{:08x}", !c)
 }
 
-pub const HASH: &[(&str, fn(&[u8]) -> String)] = &[
+pub type Hash = fn(&[u8]) -> String;
+
+pub const HASH: &[(&str, Hash)] = &[
     ("MD5", |b| hex(&<md5::Md5 as sha2::Digest>::digest(b))),
     ("SHA-1", |b| hex(&<sha1::Sha1 as sha2::Digest>::digest(b))),
     ("SHA-256", |b| hex(&<sha2::Sha256 as sha2::Digest>::digest(b))),
@@ -787,5 +789,46 @@ mod tests {
 
         assert_eq!(run(csv_to_json, "a,b\n1,\"x,\"\"y\"\n"), "[\n    {\n        \"a\": \"1\",\n        \"b\": \"x,\\\"y\"\n    }\n]\n");
         assert_eq!(run(LINES[2].1, "b\r\na\r\nb\r\n"), "b\r\na\r\n");
+    }
+}
+
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+
+    /// Thousands of random inputs through every tool: none may panic, and the byte-level
+    /// encoders must round-trip exactly.
+    #[test]
+    fn every_tool_survives_garbage() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move |m: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % m.max(1) as u64) as usize
+        };
+        let mut alphabet: Vec<&str> = r#"< > / " ' = [ ] { } , : & ; # % \ \n \t a z Q 0 9 - _ . é 😀 <!-- --> <![CDATA[ ]]> <? ?> true null 1e9 &amp; &#x41; %41 \u0041 \uD83D \x4 \u{1F600}"#
+            .split(' ')
+            .collect();
+        alphabet.extend(["\n", "\r\n", "\t", " "]);
+        let tools: Vec<(&str, Tool)> = ENCODE.iter().chain(DECODE).chain(CASE).chain(LINES).copied().chain(FORMAT.iter().flat_map(|(_, t)| t.iter().copied())).collect();
+        for round in 0..3000 {
+            let input: Vec<u8> = if round % 2 == 0 {
+                (0..rnd(300)).map(|_| rnd(256) as u8).collect()
+            } else {
+                (0..rnd(80)).map(|_| alphabet[rnd(alphabet.len())]).collect::<String>().into_bytes()
+            };
+            for (name, t) in &tools {
+                let r = std::panic::catch_unwind(|| t(&input));
+                assert!(r.is_ok(), "{name} panicked on {:?}", String::from_utf8_lossy(&input));
+            }
+            for (_, h) in HASH {
+                h(&input);
+            }
+            let bytes: Vec<u8> = (0..rnd(64)).map(|_| rnd(256) as u8).collect();
+            for (enc, dec) in [(ENCODE[0].1, base64_decode as Tool), (ENCODE[1].1, base64_decode), (base32, base32_decode), (ENCODE[3].1, hex_decode), (url_encode, url_decode), (binary, binary_decode), (rot13, rot13)] {
+                assert_eq!(dec(&enc(&bytes).unwrap()).unwrap(), bytes);
+            }
+        }
     }
 }

@@ -9,6 +9,9 @@ use std::path::PathBuf;
 // ponytail: lines longer than this are drawn truncated; window the horizontal range if it matters.
 pub const MAX_LINE: usize = 20_000;
 const UNDO_LIMIT: usize = 1000;
+/// Undo also stops growing once its snapshots hold this many pieces in total (~64 MB), so
+/// thousands of scattered edits can't eat memory.
+const UNDO_PIECES: usize = 2_000_000;
 /// Whole-document tools (format, replace all, line ops) need the text in memory; cap it.
 pub const TRANSFORM_LIMIT: usize = 256 << 20;
 
@@ -229,6 +232,10 @@ impl Editor {
 
     /// Writes to a temp file, then swaps it in, so a failed save never damages the original.
     pub fn save(&mut self, save_as: bool) -> bool {
+        if self.loading.is_some() {
+            self.msg = Some("Still opening the file; save again in a moment".into());
+            return false;
+        }
         let path = match (&self.path, save_as) {
             (Some(p), false) => p.clone(),
             _ => match self.save_dialog() {
@@ -261,6 +268,10 @@ impl Editor {
 
     /// Writes the text elsewhere and keeps editing this file.
     pub fn save_copy(&mut self) {
+        if self.loading.is_some() {
+            self.msg = Some("Still opening the file; try again in a moment".into());
+            return;
+        }
         if let Some(p) = self.save_dialog() {
             self.msg = Some(match self.doc.write_to(&p) {
                 Ok(()) => format!("Copy saved to {}", p.display()),
@@ -278,8 +289,9 @@ impl Editor {
     fn begin_edit(&mut self, typing: bool) {
         if !(typing && self.typing) {
             self.undo.push((self.doc.snapshot(), self.cursor));
-            if self.undo.len() > UNDO_LIMIT {
-                self.undo.remove(0);
+            let mut pieces: usize = self.undo.iter().map(|(p, _)| p.len()).sum();
+            while self.undo.len() > UNDO_LIMIT || (pieces > UNDO_PIECES && self.undo.len() > 1) {
+                pieces -= self.undo.remove(0).0.len();
             }
         }
         self.typing = typing;
@@ -423,7 +435,9 @@ impl Editor {
             return;
         }
         let input = self.doc.bytes(r.clone());
-        match f(&input) {
+        // A bug in a formatter library must not take the unsaved text down with it.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&input))).unwrap_or_else(|_| Err("crashed on this input (nothing was changed)".into()));
+        match result {
             Ok(out) if out == input => self.msg = Some(format!("{name}: nothing to change")),
             Ok(out) => {
                 self.begin_edit(false);
@@ -459,13 +473,13 @@ impl Editor {
     pub fn find_next(&mut self, re: &Regex, forward: bool) -> bool {
         let sel = self.selection().unwrap_or(self.cursor..self.cursor);
         let from = if forward { sel.end } else { sel.start };
-        let wrap = if forward { 0 } else { self.doc.len() };
         let mut hit = self.doc.find(re, from, forward);
         // An empty match (e.g. `^`) right at the cursor would be found again forever; step past it.
         if hit.as_ref().is_some_and(|r| r.is_empty() && r.start == self.cursor) {
             hit = if forward { self.doc.find(re, from + 1, true) } else { self.doc.find(re, from.saturating_sub(1), false) };
         }
-        match hit.or_else(|| self.doc.find(re, wrap, forward)) {
+        let rest = if forward { 0..from } else { from..self.doc.len() };
+        match hit.or_else(|| self.doc.find_in(re, rest, forward)) {
             Some(r) => {
                 self.jump(r);
                 true
@@ -833,5 +847,90 @@ mod tests {
         assert_eq!(e.selection(), Some(0..4));
         assert_eq!(text(&e), "]la[ beta\r\ngamma $X");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn edge_cases_and_failed_saves() {
+        // Every operation on an empty document is a harmless no-op.
+        let mut e = Editor::new(1);
+        e.doc.crlf = false;
+        e.delete_line();
+        e.duplicate_line(); // duplicating the one empty line adds a newline
+        assert_eq!(e.doc.len(), 1);
+        e.undo_redo(false);
+        e.undo_redo(true);
+        e.undo_redo(false);
+        e.undo_redo(false); // nothing left to undo
+        assert!(!e.find_next(&re("x", false), true));
+        assert!(!e.find_next(&re("x", false), false));
+        e.transform("t", |b| Ok(b.to_vec()));
+        e.replace_all(&re("x", false), "y", false);
+        e.set_line_endings(false);
+        e.delete(0..0);
+        assert_eq!(e.doc.len(), 0);
+
+        // A tool that panics leaves the text alone and reports it.
+        e.insert(b"keep me", false);
+        e.select_all();
+        e.transform("boom", |_| panic!("library bug"));
+        assert_eq!(text(&e), "keep me");
+        assert!(e.msg.take().unwrap().contains("crashed"));
+
+        let dir = std::env::temp_dir().join("te_save_tests");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Saving while the file is (re)opening is refused, so the empty placeholder can't overwrite it.
+        let file = dir.join("opening.txt");
+        std::fs::write(&file, "original").unwrap();
+        let mut opening = Editor::open(2, file.clone());
+        assert!(!opening.save(false));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
+
+        // Saving into a folder that doesn't exist fails cleanly and leaves no temp file behind.
+        e.path = Some(dir.join("missing").join("x.txt"));
+        assert!(!e.save(false));
+        assert!(e.msg.take().unwrap().starts_with("Save failed"));
+        assert_eq!(text(&e), "keep me");
+
+        // A read-only target can't be replaced: the original stays, the text is kept in the temp file.
+        let ro = dir.join("readonly.txt");
+        std::fs::write(&ro, "old").unwrap();
+        let mut perm = std::fs::metadata(&ro).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&ro, perm.clone()).unwrap();
+        e.path = Some(ro.clone());
+        e.save(false);
+        while e.poll().is_none() && e.loading.is_some() {
+            std::thread::yield_now();
+        }
+        assert_eq!(std::fs::read_to_string(&ro).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(dir.join("readonly.txt.te-tmp")).unwrap(), "keep me");
+        assert_eq!(text(&e), "keep me");
+        perm.set_readonly(false);
+        std::fs::set_permissions(&ro, perm).unwrap();
+        drop(e);
+        drop(opening);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_memory_is_bounded() {
+        let mut e = Editor::new(3);
+        e.insert(&b"line of text\n".repeat(20_000), false);
+        // Thousands of scattered single edits: each adds pieces, and each is its own undo step.
+        for i in 0..3000usize {
+            e.anchor = None;
+            e.cursor = (i * 7919) % e.doc.len();
+            e.insert(b"x\n", false);
+        }
+        let held: usize = e.undo.iter().map(|(p, _)| p.len()).sum();
+        let last = e.undo.last().map_or(0, |(p, _)| p.len());
+        assert!(held <= UNDO_PIECES + last, "undo holds {held} pieces");
+        assert!(e.undo.len() <= UNDO_LIMIT);
+        // Undo still works after trimming.
+        let before = e.doc.len();
+        e.undo_redo(false);
+        assert_eq!(e.doc.len(), before - 2);
     }
 }

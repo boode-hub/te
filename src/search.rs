@@ -100,7 +100,7 @@ fn lossy(b: &[u8]) -> String {
 
 fn search_doc(doc: &Doc, re: &Regex, hits: &AtomicUsize, cancel: &AtomicBool) -> Vec<Hit> {
     let mut out = Vec::new();
-    doc.scan(re, 0, |r| {
+    doc.scan(re, 0..doc.len(), |r| {
         if out.len() >= FILE_HITS || cancel.load(Ordering::Relaxed) || hits.fetch_add(1, Ordering::Relaxed) >= MAX_HITS {
             return false;
         }
