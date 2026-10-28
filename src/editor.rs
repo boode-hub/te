@@ -907,6 +907,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&ro).unwrap(), "old");
         assert_eq!(std::fs::read_to_string(dir.join("readonly.txt.te-tmp")).unwrap(), "keep me");
         assert_eq!(text(&e), "keep me");
+        #[allow(clippy::permissions_set_readonly_false)] // Windows: clears the read-only attribute
         perm.set_readonly(false);
         std::fs::set_permissions(&ro, perm).unwrap();
         drop(e);

@@ -268,7 +268,7 @@ impl Doc {
             return self.len();
         }
         let e = self.line_start(n + 1) - 1;
-        if e > 0 && self.bytes(e - 1..e) == b"\r" && e - 1 >= self.line_start(n) { e - 1 } else { e }
+        if e > 0 && self.bytes(e - 1..e) == b"\r" && e > self.line_start(n) { e - 1 } else { e }
     }
 
     pub fn line_of(&self, off: usize) -> usize {

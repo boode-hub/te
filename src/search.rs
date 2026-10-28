@@ -147,33 +147,50 @@ pub fn start(label: String, re: Regex, tabs: Vec<(u64, String, Doc)>, folder: Op
             push(name, Target::Tab(id), found);
         }
         let Some(root) = folder else { return };
+        // List the files first (cheap), then search them on a few threads. Each thread holds one
+        // file at a time, so memory stays bounded; 4 keeps the worst case (four ~60 MB files
+        // read at once) modest while still overlapping disk waits.
+        let mut files = Vec::new();
         let mut stack = vec![root.clone()];
         while let Some(dir) = stack.pop() {
+            if c.load(Ordering::Relaxed) {
+                return;
+            }
             let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-            let mut entries: Vec<_> = rd.flatten().collect();
-            entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
-            for e in entries {
-                if c.load(Ordering::Relaxed) || h.load(Ordering::Relaxed) >= MAX_HITS {
-                    return;
-                }
-                let path = e.path();
+            for e in rd.flatten() {
                 let Ok(ft) = e.file_type() else { continue };
                 if ft.is_dir() {
                     if e.file_name() != ".git" {
-                        stack.push(path);
+                        stack.push(e.path());
                     }
-                    continue;
+                } else if !skip.contains(&e.path()) {
+                    files.push(e.path());
                 }
-                if skip.contains(&path) || looks_binary(&path) {
-                    continue;
-                }
-                // One file mapped at a time; it's unmapped as soon as `doc` drops.
-                let Ok(doc) = doc::load(&path, &AtomicUsize::new(0)) else { continue };
-                let found = search_doc(&doc, &re, &h, &c);
-                let name = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().into_owned();
-                push(name, Target::File(path), found);
             }
         }
+        files.sort();
+        let next = AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(4);
+        std::thread::scope(|sc| {
+            for _ in 0..workers {
+                sc.spawn(|| {
+                    while let Some(path) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        if c.load(Ordering::Relaxed) || h.load(Ordering::Relaxed) >= MAX_HITS {
+                            return;
+                        }
+                        let found = if looks_binary(path) {
+                            Vec::new()
+                        } else {
+                            doc::load(path, &AtomicUsize::new(0)).map(|doc| search_doc(&doc, &re, &h, &c)).unwrap_or_default()
+                        };
+                        let name = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().into_owned();
+                        push(name, Target::File(path.clone()), found);
+                    }
+                });
+            }
+        });
+        // Threads finish files out of order; show the results sorted by path.
+        r.lock().unwrap().sort_by(|a, b| a.name.cmp(&b.name));
     });
     Search { label, results, files_done, hits, cancel, handle: Some(handle) }
 }
@@ -243,4 +260,26 @@ fn memory() {
     drop(docs);
     say("all dropped");
     std::thread::sleep(std::time::Duration::from_secs(3));
+}
+
+/// Folder-search load check: TE_FOLDER=D:\some\big\tree cargo test --release folder_load -- --ignored --nocapture
+#[cfg(test)]
+#[test]
+#[ignore]
+fn folder_load() {
+    let root = PathBuf::from(std::env::var("TE_FOLDER").unwrap());
+    let re = Query { text: "fn main".into(), case: true, ..Default::default() }.build().unwrap();
+    let t = std::time::Instant::now();
+    let s = start("load".into(), re, vec![], Some(root), vec![]);
+    while s.running() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let res = s.results.lock().unwrap();
+    println!(
+        "folder search: {} files scanned, {} files matched, {} hits in {:?}",
+        s.files_done.load(Ordering::Relaxed),
+        res.len(),
+        res.iter().map(|f| f.hits.len()).sum::<usize>(),
+        t.elapsed()
+    );
 }

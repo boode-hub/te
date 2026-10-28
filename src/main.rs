@@ -1678,6 +1678,13 @@ fn main() -> eframe::Result {
                     ..egui_wgpu::WgpuSetupCreateNew::without_display_handle().instance_descriptor
                 },
                 power_preference: egui_wgpu::wgpu::PowerPreference::LowPower,
+                // A text editor needs little GPU memory: don't reserve big blocks up front.
+                device_descriptor: Arc::new(|_| egui_wgpu::wgpu::DeviceDescriptor {
+                    label: Some("te"),
+                    required_limits: egui_wgpu::wgpu::Limits { max_texture_dimension_2d: 8192, ..Default::default() },
+                    memory_hints: egui_wgpu::wgpu::MemoryHints::MemoryUsage,
+                    ..Default::default()
+                }),
                 ..egui_wgpu::WgpuSetupCreateNew::without_display_handle()
             }),
             ..Default::default()

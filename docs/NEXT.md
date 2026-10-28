@@ -33,6 +33,20 @@ State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites
   Shift+Enter, case-insensitive), separate from the main find bar, highlighting only in that pane
 - GUI checked by hand: tabs, HTML + JSON pretty print, split view, search across tabs, folder panel, logo
 
+## Review 2026-10-28 (numbers on this laptop)
+- Fixed: Ctrl+S while a file was reopening could save the empty placeholder over it (now refused);
+  find-next wrap rescanned the whole file (now only the unsearched part); undo capped by size
+  (2M pieces) as well as steps; length/line count O(1); line lookups binary-search a cached
+  per-piece table and each piece stores its original-file newline base (one screen with 40k edit
+  pieces: 15-29 ms -> 1.1 ms); tool panics are caught (text untouched); folder search on 4 threads
+  (90k files in D:\SS: 164 s -> 34 s, peak 83 MB); wgpu MemoryHints::MemoryUsage (442 -> 270 MB private)
+- Tests: 8 suites incl. 3000-round fuzz of every tool, empty-doc ops, save refused while opening,
+  save into missing folder, read-only target keeps original + temp copy, undo memory bound
+- Measured: 1.5 GB opens in 0.12-0.44 s, line jump ~8 us, regex 1-1.6 GB/s; 100 MB one-line file
+  opens in 19 ms; 5 x 1.5 GB tabs + search peak 30 MB private, 2 MB after closing;
+  idle CPU ~0.2%; first frame ~1.3 s (GPU start-up)
+- Opt-in checks: `bench` (TE_BENCH=file), `memory` (TE_BENCH=file), `folder_load` (TE_FOLDER=dir)
+
 ## Open (pick up here)
 1. GUI-test by hand (not automatable while someone uses the PC): per-pane search, the colour dialog,
    divider dragging, independent scroll
@@ -41,6 +55,7 @@ State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites
    from menus, Save as / Save all, unsaved-changes prompts.
    Testing note: SendKeys letters arrive as Unicode packets on a non-Latin layout (no Key event), so
    use real virtual keys (keybd_event) when scripting shortcuts like Ctrl+Z.
-2. Known limits: two panes on one file share one cursor/selection (scroll is separate); undo history resets on save;
+2. Known limits: find-next in one huge file still runs on the UI thread (one pass, ~1 s/GB on a miss);
+   a >64 MB file on a network drive that disconnects while open can crash (memory-mapped); two panes on one file share one cursor/selection (scroll is separate); undo history resets on save;
    lines > 20k chars draw truncated; regex matches > 64 KiB across an 8 MiB block edge can be cut short.
 3. Solid colour presets: user said "leave it for now".
