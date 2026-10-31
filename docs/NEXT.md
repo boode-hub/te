@@ -47,6 +47,15 @@ State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites
   idle CPU ~0.2%; first frame ~1.3 s (GPU start-up)
 - Opt-in checks: `bench` (TE_BENCH=file), `memory` (TE_BENCH=file), `folder_load` (TE_FOLDER=dir)
 
+- Find-next in documents over 16 MB runs on a background thread in 64 MB slices; status bar shows
+  "Searching… (Esc to cancel)"; edits, undo, save and reload cancel it first
+
+## Build output and test data
+- The ready-to-run app is copied to dist/te.exe (git-ignored). `cargo build --release` puts a fresh one
+  in target/release/; copy it to dist/ after building.
+- Test data was deleted to save space. The opt-in checks need a file you supply, e.g. generate a big
+  log and run `TE_BENCH=that.log cargo test --release bench -- --ignored --nocapture`.
+
 ## Open (pick up here)
 1. GUI-test by hand (not automatable while someone uses the PC): per-pane search, the colour dialog,
    divider dragging, independent scroll
@@ -55,7 +64,6 @@ State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites
    from menus, Save as / Save all, unsaved-changes prompts.
    Testing note: SendKeys letters arrive as Unicode packets on a non-Latin layout (no Key event), so
    use real virtual keys (keybd_event) when scripting shortcuts like Ctrl+Z.
-2. Known limits: find-next in one huge file still runs on the UI thread (one pass, ~1 s/GB on a miss);
-   a >64 MB file on a network drive that disconnects while open can crash (memory-mapped); two panes on one file share one cursor/selection (scroll is separate); undo history resets on save;
+2. Known limits: a >64 MB file on a network drive that disconnects while open can crash (memory-mapped); two panes on one file share one cursor/selection (scroll is separate); undo history resets on save;
    lines > 20k chars draw truncated; regex matches > 64 KiB across an 8 MiB block edge can be cut short.
 3. Solid colour presets: user said "leave it for now".

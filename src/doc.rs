@@ -414,6 +414,7 @@ impl Doc {
     }
 
     /// First match at or after `from` (forward) or the last one starting before `from` (backward).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn find(&self, re: &Regex, from: usize, forward: bool) -> Option<Range<usize>> {
         if forward { self.find_in(re, from..self.len(), true) } else { self.find_in(re, 0..from, false) }
     }

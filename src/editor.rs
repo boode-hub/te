@@ -5,6 +5,9 @@ use eframe::egui::{self, Align2, Color32, CornerRadius, Event, FontId, Key, Modi
 use regex::bytes::{NoExpand, Regex};
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 
 // ponytail: lines longer than this are drawn truncated; window the horizontal range if it matters.
 pub const MAX_LINE: usize = 20_000;
@@ -12,6 +15,10 @@ const UNDO_LIMIT: usize = 1000;
 /// Undo also stops growing once its snapshots hold this many pieces in total (~64 MB), so
 /// thousands of scattered edits can't eat memory.
 const UNDO_PIECES: usize = 2_000_000;
+/// Find-next in documents bigger than this runs on a background thread (Esc cancels).
+const FIND_IN_BACKGROUND: usize = 16 << 20;
+/// Background finds work in slices this big, so a cancel takes effect within one slice.
+const FIND_SLICE: usize = 64 << 20;
 /// Whole-document tools (format, replace all, line ops) need the text in memory; cap it.
 pub const TRANSFORM_LIMIT: usize = 256 << 20;
 
@@ -74,6 +81,9 @@ pub struct PaneView {
     pub scroll_x: f32,
 }
 
+/// A background find: its thread (whose result is None if cancelled) and its cancel flag.
+type Finding = (JoinHandle<Option<Option<Range<usize>>>>, Arc<AtomicBool>);
+
 pub struct Editor {
     pub id: u64,
     pub doc: Doc,
@@ -98,6 +108,8 @@ pub struct Editor {
     rows: usize,
     /// Message for the status bar, taken by the app each frame.
     pub msg: Option<String>,
+    /// A find-next running in the background: its result (None = cancelled) and its cancel flag.
+    finding: Option<Finding>,
 }
 
 /// Tabs aren't handled by egui's layout, so draw each as 4 spaces.
@@ -116,6 +128,38 @@ fn byte_of_display(b: &[u8], ci: usize) -> usize {
         }
     }
     b.len()
+}
+
+/// One find-next: from `from` to the end (or start), then wrapped around. `None` if cancelled.
+fn find_wrapping(doc: &Doc, re: &Regex, from: usize, forward: bool, cursor: usize, cancel: &AtomicBool) -> Option<Option<Range<usize>>> {
+    let len = doc.len();
+    let mut hit = find_sliced(doc, re, if forward { from..len } else { 0..from }, forward, cancel, FIND_SLICE)?;
+    // An empty match (e.g. `^`) right at the cursor would be found again forever; step past it.
+    if hit.as_ref().is_some_and(|r| r.is_empty() && r.start == cursor) {
+        hit = find_sliced(doc, re, if forward { (from + 1).min(len)..len } else { 0..from.saturating_sub(1) }, forward, cancel, FIND_SLICE)?;
+    }
+    if hit.is_none() {
+        hit = find_sliced(doc, re, if forward { 0..from } else { from..len }, forward, cancel, FIND_SLICE)?;
+    }
+    Some(hit)
+}
+
+/// `Doc::find_in` over `r` in FIND_SLICE pieces, checking `cancel` between them. Exact: a match
+/// only has to start inside a slice, and the scan reads past the slice end to finish it.
+fn find_sliced(doc: &Doc, re: &Regex, r: Range<usize>, forward: bool, cancel: &AtomicBool, slice: usize) -> Option<Option<Range<usize>>> {
+    let mut slices: Vec<Range<usize>> = (r.start..r.end).step_by(slice).map(|a| a..(a + slice).min(r.end)).collect();
+    if !forward {
+        slices.reverse();
+    }
+    for s in slices {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        if let Some(m) = doc.find_in(re, s, forward) {
+            return Some(Some(m));
+        }
+    }
+    Some(None)
 }
 
 pub fn width(ctx: &egui::Context, font: &FontId, b: &[u8]) -> f32 {
@@ -143,6 +187,7 @@ impl Editor {
             typing: false,
             rows: 30,
             msg: None,
+            finding: None,
         }
     }
 
@@ -163,6 +208,7 @@ impl Editor {
     }
 
     fn start_load(&mut self, path: PathBuf, restore: Option<(Range<usize>, f64)>) {
+        self.cancel_find(true);
         self.doc = Doc::new();
         self.undo.clear();
         self.redo.clear();
@@ -251,6 +297,8 @@ impl Editor {
             self.msg = Some(format!("Save failed: {e}"));
             return false;
         }
+        // A background find holds a snapshot that may map this file; it must let go before the swap.
+        self.cancel_find(true);
         let restore = Some((self.anchor.unwrap_or(self.cursor)..self.cursor, self.top));
         self.doc = Doc::new(); // release the mapping so Windows lets us replace the file
         match std::fs::rename(&tmp, &path) {
@@ -287,6 +335,7 @@ impl Editor {
     }
 
     fn begin_edit(&mut self, typing: bool) {
+        self.cancel_find(false);
         if !(typing && self.typing) {
             self.undo.push((self.doc.snapshot(), self.cursor));
             let mut pieces: usize = self.undo.iter().map(|(p, _)| p.len()).sum();
@@ -327,6 +376,7 @@ impl Editor {
     }
 
     pub fn undo_redo(&mut self, redo: bool) {
+        self.cancel_find(false);
         let (from, to) = if redo { (&mut self.redo, &mut self.undo) } else { (&mut self.undo, &mut self.redo) };
         if let Some((pieces, cursor)) = from.pop() {
             to.push((self.doc.snapshot(), self.cursor));
@@ -470,16 +520,26 @@ impl Editor {
 
     // ---------- find / replace ----------
 
+    /// Selects the next (or previous) match, wrapping around. Big documents are searched in the
+    /// background; the result arrives through `poll_find`. Returns false only for a definite miss.
     pub fn find_next(&mut self, re: &Regex, forward: bool) -> bool {
+        self.cancel_find(false);
         let sel = self.selection().unwrap_or(self.cursor..self.cursor);
         let from = if forward { sel.end } else { sel.start };
-        let mut hit = self.doc.find(re, from, forward);
-        // An empty match (e.g. `^`) right at the cursor would be found again forever; step past it.
-        if hit.as_ref().is_some_and(|r| r.is_empty() && r.start == self.cursor) {
-            hit = if forward { self.doc.find(re, from + 1, true) } else { self.doc.find(re, from.saturating_sub(1), false) };
+        if self.doc.len() < FIND_IN_BACKGROUND {
+            let hit = find_wrapping(&self.doc, re, from, forward, self.cursor, &AtomicBool::new(false)).flatten();
+            return self.found(hit);
         }
-        let rest = if forward { 0..from } else { from..self.doc.len() };
-        match hit.or_else(|| self.doc.find_in(re, rest, forward)) {
+        let (doc, re, cursor) = (self.doc.clone(), re.clone(), self.cursor);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let handle = std::thread::spawn(move || find_wrapping(&doc, &re, from, forward, cursor, &flag));
+        self.finding = Some((handle, cancel));
+        true
+    }
+
+    fn found(&mut self, hit: Option<Range<usize>>) -> bool {
+        match hit {
             Some(r) => {
                 self.jump(r);
                 true
@@ -488,6 +548,36 @@ impl Editor {
                 self.msg = Some("No matches".into());
                 false
             }
+        }
+    }
+
+    pub fn is_finding(&self) -> bool {
+        self.finding.is_some()
+    }
+
+    /// Stops a background find. `wait` also joins it, releasing its snapshot of the document.
+    pub fn cancel_find(&mut self, wait: bool) {
+        if let Some((handle, cancel)) = self.finding.take() {
+            cancel.store(true, Ordering::Relaxed);
+            if wait {
+                let _ = handle.join();
+            }
+            self.msg = Some("Search cancelled".into());
+        }
+    }
+
+    /// Applies a finished background find.
+    pub fn poll_find(&mut self) {
+        if !self.finding.as_ref().is_some_and(|(h, _)| h.is_finished()) {
+            return;
+        }
+        let (handle, _) = self.finding.take().unwrap();
+        match handle.join() {
+            Ok(Some(hit)) => {
+                self.found(hit);
+            }
+            Ok(None) => self.msg = Some("Search cancelled".into()),
+            Err(_) => self.msg = Some("Search failed".into()),
         }
     }
 
@@ -933,5 +1023,51 @@ mod tests {
         let before = e.doc.len();
         e.undo_redo(false);
         assert_eq!(e.doc.len(), before - 2);
+    }
+
+    #[test]
+    fn background_find_and_cancel() {
+        // Tiny slices give the same answers as one big search, including matches across slice edges.
+        let mut small = Editor::new(5);
+        small.insert(b"abcabcXYZabcXYZab", false);
+        let xyz = re("cXYZa", false);
+        let never = AtomicBool::new(false);
+        for (r, fwd) in [(0..17, true), (0..17, false), (3..12, true), (3..12, false), (9..10, true)] {
+            assert_eq!(find_sliced(&small.doc, &xyz, r.clone(), fwd, &never, 2).flatten(), small.doc.find_in(&xyz, r, fwd));
+        }
+
+        // A document over the threshold is searched in the background.
+        let mut e = Editor::new(4);
+        e.doc.crlf = false;
+        e.insert(&b"lorem ipsum
+".repeat(2_000_000), false);
+        let at = e.doc.len();
+        e.insert(b"NEEDLE", false);
+        let wait = |e: &mut Editor| {
+            while e.is_finding() {
+                e.poll_find();
+                std::thread::yield_now();
+            }
+        };
+        for forward in [true, false] {
+            (e.cursor, e.anchor) = (0, None);
+            assert!(e.find_next(&re("NEEDLE", false), forward));
+            assert!(e.is_finding());
+            wait(&mut e);
+            assert_eq!(e.selection(), Some(at..at + 6));
+        }
+
+        // Esc (cancel) stops it and says so; typing cancels a running find too.
+        assert!(e.find_next(&re("MISSING", false), true));
+        e.cancel_find(true);
+        assert!(!e.is_finding());
+        assert_eq!(e.msg.take().as_deref(), Some("Search cancelled"));
+        e.find_next(&re("MISSING", false), true);
+        e.insert(b"x", false);
+        assert!(!e.is_finding());
+        // A miss over the whole document reports it.
+        e.find_next(&re("MISSING", false), true);
+        wait(&mut e);
+        assert_eq!(e.msg.take().as_deref(), Some("No matches"));
     }
 }

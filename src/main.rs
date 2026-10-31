@@ -752,8 +752,12 @@ impl App {
         if k(cmd, Key::Comma) {
             self.settings_open = !self.settings_open;
         }
-        if k(none, Key::Escape) && self.goto.take().is_none() && !std::mem::take(&mut self.find_open) {
-            self.settings_open = false;
+        if k(none, Key::Escape) {
+            if self.tabs[self.cur()].is_finding() {
+                self.ed().cancel_find(false);
+            } else if self.goto.take().is_none() && !std::mem::take(&mut self.find_open) {
+                self.settings_open = false;
+            }
         }
         let zoom = ctx.input(|i| i.zoom_delta());
         if zoom != 1.0 {
@@ -1365,7 +1369,13 @@ impl App {
         ui.horizontal_centered(|ui| {
             let dim = |t: String| RichText::new(t).size(12.0).color(fg.gamma_multiply(0.55));
             let e = &self.tabs[self.cur()];
-            let left = if self.status.is_empty() { e.path.as_ref().map_or(e.name(), |p| p.display().to_string()) } else { self.status.clone() };
+            let left = if e.is_finding() {
+                "Searching… (Esc to cancel)".to_string()
+            } else if self.status.is_empty() {
+                e.path.as_ref().map_or(e.name(), |p| p.display().to_string())
+            } else {
+                self.status.clone()
+            };
             ui.add(egui::Label::new(dim(left)).truncate());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (line, col) = e.line_col();
@@ -1598,6 +1608,7 @@ impl eframe::App for App {
             if let Some(p) = self.tabs[i].poll() {
                 self.add_recent(&p);
             }
+            self.tabs[i].poll_find();
             if let Some(m) = self.tabs[i].msg.take() {
                 self.status = m;
             }
@@ -1625,6 +1636,9 @@ impl eframe::App for App {
             if p.is_dir() { self.set_folder(p) } else { self.open_path(p) }
         }
         self.shortcuts(&ctx);
+        if self.tabs.iter().any(|t| t.is_finding()) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
 
         let title = { let e = &self.tabs[self.cur()]; format!("{}{} — te", if e.modified { "• " } else { "" }, e.name()) };
         if title != self.title {
