@@ -55,6 +55,10 @@ State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites
   in target/release/; copy it to dist/ after building.
 - Test data was deleted to save space. The opt-in checks need a file you supply, e.g. generate a big
   log and run `TE_BENCH=that.log cargo test --release bench -- --ignored --nocapture`.
+- File > Split into parts (split.rs): numbered files of at most N bytes/KB/MB/GB (decimal units),
+  cut after a full line by default, background thread with progress and Cancel; on cancel or error
+  the written parts are deleted; saving waits while a split runs. 1 GB into 50 MB parts: 2.0 s.
+  Opt-in check: `TE_BENCH=file cargo test --release split_speed -- --ignored --nocapture`
 
 ## Open (pick up here)
 1. GUI-test by hand (not automatable while someone uses the PC): per-pane search, the colour dialog,

@@ -2,6 +2,7 @@
 mod doc;
 mod editor;
 mod search;
+mod split;
 mod tools;
 
 use editor::{Editor, PaneView, Theme, View};
@@ -408,6 +409,14 @@ struct App {
     search: Option<Search>,
     results_open: bool,
     settings_open: bool,
+    split_open: bool,
+    split_size: f64,
+    split_unit: usize,
+    split_lines: bool,
+    split_dir: Option<PathBuf>,
+    split_job: Option<split::Job>,
+    /// Last finished split: how many files, and where (for the "Open folder" button).
+    split_done: Option<(usize, PathBuf)>,
     fonts: Vec<(&'static str, String, String)>,
     font_filter: String,
     s: Settings,
@@ -457,6 +466,13 @@ impl App {
             search: None,
             results_open: false,
             settings_open: false,
+            split_open: false,
+            split_size: 50.0,
+            split_unit: 2,
+            split_lines: true,
+            split_dir: None,
+            split_job: None,
+            split_done: None,
             fonts: Vec::new(),
             font_filter: String::new(),
             saved_cfg: s.serialize(),
@@ -594,11 +610,19 @@ impl App {
     }
 
     fn save(&mut self, save_as: bool) {
+        if self.split_job.is_some() {
+            self.status = "Wait for the split to finish (or cancel it) before saving".into();
+            return;
+        }
         self.stop_search(); // a running search may still map this file, which blocks replacing it
         self.ed().save(save_as);
     }
 
     fn save_all(&mut self) {
+        if self.split_job.is_some() {
+            self.status = "Wait for the split to finish (or cancel it) before saving".into();
+            return;
+        }
         self.stop_search();
         for e in self.tabs.iter_mut().filter(|e| e.modified && e.path.is_some()) {
             e.save(false);
@@ -810,6 +834,11 @@ impl App {
                 }
                 if item(ui, "Save all", "") {
                     self.save_all();
+                }
+                ui.separator();
+                if item(ui, "Split into parts…", "") {
+                    self.split_open = true;
+                    self.split_done = None;
                 }
                 ui.separator();
                 if item(ui, "Close tab", "Ctrl+W") {
@@ -1198,6 +1227,82 @@ impl App {
         }
     }
 
+    /// File > Split into parts: cut the current document into numbered files of at most N bytes.
+    fn split_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.split_open;
+        let (mut go, mut pick_dir, mut open_dir) = (false, false, None);
+        let e = &self.tabs[self.cur()];
+        let (len, name) = (e.doc.len(), e.name());
+        let dir = self.split_dir.clone().or_else(|| e.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf));
+        let max = (self.split_size * split::UNITS[self.split_unit].1).round().max(1.0) as usize;
+        egui::Window::new("Split into parts").open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_TOP, [0.0, 80.0]).show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            if let Some(job) = &self.split_job {
+                let done = job.done.load(Ordering::Relaxed);
+                ui.label(format!("Writing parts… {} of {}", human_size(done), human_size(job.total)));
+                ui.add(egui::ProgressBar::new(done as f32 / job.total.max(1) as f32).desired_width(340.0).show_percentage());
+                if ui.button("Cancel").on_hover_text("Stops and deletes the parts written so far").clicked() {
+                    job.cancel();
+                }
+                return;
+            }
+            ui.label(RichText::new(format!("{name}  ·  {}", human_size(len))).strong());
+            ui.horizontal(|ui| {
+                ui.label("Each part at most");
+                ui.add(egui::DragValue::new(&mut self.split_size).range(1.0..=1e12).speed(1.0).max_decimals(3));
+                egui::ComboBox::from_id_salt("split_unit").width(70.0).selected_text(split::UNITS[self.split_unit].0).show_ui(ui, |ui| {
+                    for (i, (unit, _)) in split::UNITS.iter().enumerate() {
+                        ui.selectable_value(&mut self.split_unit, i, *unit);
+                    }
+                });
+            });
+            ui.checkbox(&mut self.split_lines, "Cut after a full line (no line is broken between two files)");
+            ui.weak("1 KB = 1,000 bytes and 1 MB = 1,000,000 bytes, so parts fit upload limits either way.");
+            ui.horizontal(|ui| {
+                ui.label("Save to");
+                ui.add(egui::Label::new(dir.as_ref().map_or("choose a folder".into(), |d| d.display().to_string())).truncate());
+                pick_dir = ui.small_button("Change…").clicked();
+            });
+            let est = split::estimate(len, max);
+            if len > 0 {
+                let names = if est > 1 { format!("{} … {}", split::part_name(&name, 1, est), split::part_name(&name, est, est)) } else { split::part_name(&name, 1, est) };
+                ui.label(format!("About {est} file{}: {names}", if est == 1 { "" } else { "s" }));
+            } else {
+                ui.weak("This document is empty (or still opening).");
+            }
+            if let Some((n, d)) = &self.split_done {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Done: {n} files written."));
+                    if ui.small_button("Open folder").clicked() {
+                        open_dir = Some(d.clone());
+                    }
+                });
+            }
+            go = ui.add_enabled(len > 0 && dir.is_some(), egui::Button::new("Split")).clicked();
+        });
+        self.split_open = open;
+        if pick_dir && let Some(d) = rfd::FileDialog::new().pick_folder() {
+            self.split_dir = Some(d);
+        }
+        if let Some(d) = open_dir {
+            let _ = std::process::Command::new("explorer").arg(d).spawn();
+        }
+        let Some(dir) = dir.filter(|_| go) else { return };
+        let est = split::estimate(len, max);
+        if (1..=est).any(|i| dir.join(split::part_name(&name, i, est)).exists()) {
+            let replace = rfd::MessageDialog::new()
+                .set_title("te")
+                .set_description("Part files with these names already exist in that folder. Replace them?")
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+            if replace != rfd::MessageDialogResult::Yes {
+                return;
+            }
+        }
+        self.split_done = None;
+        self.split_job = Some(split::start(self.tabs[self.cur()].doc.clone(), dir, name, max, self.split_lines));
+    }
+
     fn goto_window(&mut self, ctx: &egui::Context) {
         let focus = self.focus_find;
         let mut go = None;
@@ -1369,7 +1474,9 @@ impl App {
         ui.horizontal_centered(|ui| {
             let dim = |t: String| RichText::new(t).size(12.0).color(fg.gamma_multiply(0.55));
             let e = &self.tabs[self.cur()];
-            let left = if e.is_finding() {
+            let left = if let Some(j) = &self.split_job {
+                format!("Splitting… {}%", j.done.load(Ordering::Relaxed) * 100 / j.total.max(1))
+            } else if e.is_finding() {
                 "Searching… (Esc to cancel)".to_string()
             } else if self.status.is_empty() {
                 e.path.as_ref().map_or(e.name(), |p| p.display().to_string())
@@ -1616,6 +1723,10 @@ impl eframe::App for App {
 
         if ctx.input(|i| i.viewport().close_requested()) {
             self.stop_search();
+            if let Some(job) = self.split_job.take() {
+                job.cancel();
+                let _ = job.join(); // deletes the parts it wrote
+            }
             for i in 0..self.tabs.len() {
                 if self.tabs[i].modified {
                     self.show_tab(i);
@@ -1636,7 +1747,20 @@ impl eframe::App for App {
             if p.is_dir() { self.set_folder(p) } else { self.open_path(p) }
         }
         self.shortcuts(&ctx);
-        if self.tabs.iter().any(|t| t.is_finding()) {
+        if self.split_job.as_ref().is_some_and(|j| j.is_finished()) {
+            let job = self.split_job.take().unwrap();
+            let dir = job.dir.clone();
+            self.status = match job.join() {
+                Ok(parts) => {
+                    let msg = format!("Split into {} files in {}", parts.len(), dir.display());
+                    self.split_done = Some((parts.len(), dir));
+                    msg
+                }
+                Err(e) if e == "cancelled" => "Split cancelled; no part files left behind".into(),
+                Err(e) => format!("Split failed: {e}; no part files left behind"),
+            };
+        }
+        if self.tabs.iter().any(|t| t.is_finding()) || self.split_job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
@@ -1662,6 +1786,9 @@ impl eframe::App for App {
         }
         egui::CentralPanel::no_frame().frame(Frame::NONE.fill(bg)).show(ui, |ui| self.panes(ui));
         self.goto_window(&ctx);
+        if self.split_open {
+            self.split_window(&ctx);
+        }
         if self.settings_open {
             self.settings(&ctx);
         }
