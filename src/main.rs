@@ -1839,6 +1839,15 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
 
+    /// Without eframe's `clipboard` feature, copy/cut/paste silently do nothing (it is a default
+    /// feature, and we turn defaults off to pick the renderer).
+    #[test]
+    fn clipboard_is_compiled_in() {
+        let manifest = include_str!("../Cargo.toml");
+        let eframe = manifest.lines().find(|l| l.starts_with("eframe")).unwrap();
+        assert!(eframe.contains("\"clipboard\""), "eframe must keep the clipboard feature: {eframe}");
+    }
+
     #[test]
     fn settings_and_profiles() {
         // An old te.cfg with only bg/fg gets the other colours derived from them.

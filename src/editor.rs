@@ -636,7 +636,11 @@ impl Editor {
         for ev in ctx.input(|i| i.events.clone()) {
             match ev {
                 Event::Text(t) => self.insert(t.as_bytes(), true),
-                Event::Paste(t) => self.insert(t.as_bytes(), false),
+                // egui hands pasted text over with LF line ends; keep the document's own style.
+                Event::Paste(t) => {
+                    let t = if self.doc.crlf { t.replace('\n', "\r\n") } else { t };
+                    self.insert(t.as_bytes(), false)
+                }
                 Event::Copy => self.copy(ctx, false),
                 Event::Cut => self.copy(ctx, true),
                 Event::Key { key, pressed: true, modifiers: m, .. } => self.key(ctx, font, key, m),
