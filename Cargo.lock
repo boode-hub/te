@@ -3044,6 +3044,7 @@ dependencies = [
 name = "te"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "eframe",
  "md-5",
  "memchr",

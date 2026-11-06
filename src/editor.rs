@@ -435,6 +435,13 @@ impl Editor {
         }
     }
 
+    /// Inserts clipboard text with this document's line endings (whatever the source used).
+    pub fn paste(&mut self, text: &str) {
+        let lf = text.replace("\r\n", "\n");
+        let t = if self.doc.crlf { lf.replace('\n', "\r\n") } else { lf };
+        self.insert(t.as_bytes(), false);
+    }
+
     pub fn goto_line(&mut self, n: usize) {
         let n = n.clamp(1, self.doc.line_count()) - 1;
         self.move_to(self.doc.line_start(n), false);
@@ -637,10 +644,7 @@ impl Editor {
             match ev {
                 Event::Text(t) => self.insert(t.as_bytes(), true),
                 // egui hands pasted text over with LF line ends; keep the document's own style.
-                Event::Paste(t) => {
-                    let t = if self.doc.crlf { t.replace('\n', "\r\n") } else { t };
-                    self.insert(t.as_bytes(), false)
-                }
+                Event::Paste(t) => self.paste(&t),
                 Event::Copy => self.copy(ctx, false),
                 Event::Cut => self.copy(ctx, true),
                 Event::Key { key, pressed: true, modifiers: m, .. } => self.key(ctx, font, key, m),
@@ -752,7 +756,26 @@ impl Editor {
             vs.top -= (d.y / line_h) as f64;
             vs.scroll_x -= d.x;
         }
-        if let Some(p) = resp.interact_pointer_pos() {
+        // Only the left button places the cursor and selects; the right button opens the menu.
+        let primary = ctx.input(|i| {
+            use egui::PointerButton::Primary;
+            i.pointer.button_down(Primary) || i.pointer.button_pressed(Primary) || i.pointer.button_released(Primary)
+        });
+        let at = |p: egui::Pos2| -> usize {
+            let line = (vs.top + ((p.y - rect.top()) / line_h) as f64).max(0.0) as usize;
+            self.pos_at_x(&ctx, font, line, p.x - text_rect.left() + vs.scroll_x)
+        };
+        // Right-clicking inside the selection keeps it (for the menu); outside, moves the cursor there.
+        if resp.secondary_clicked()
+            && let Some(p) = ctx.input(|i| i.pointer.interact_pos())
+        {
+            let pos = at(p);
+            if !self.selection().is_some_and(|r| r.contains(&pos) || r.end == pos) {
+                (self.cursor, self.anchor) = (pos, None);
+            }
+            resp.request_focus();
+        }
+        if let Some(p) = resp.interact_pointer_pos().filter(|_| primary) {
             let line = (vs.top + ((p.y - rect.top()) / line_h) as f64).max(0.0) as usize;
             let pos = self.pos_at_x(&ctx, font, line, p.x - text_rect.left() + vs.scroll_x);
             let (pressed, shift) = ctx.input(|i| (i.pointer.primary_pressed(), i.modifiers.shift));
@@ -1073,5 +1096,24 @@ mod tests {
         e.find_next(&re("MISSING", false), true);
         wait(&mut e);
         assert_eq!(e.msg.take().as_deref(), Some("No matches"));
+    }
+
+    #[test]
+    fn paste_uses_the_documents_line_endings() {
+        for (doc_crlf, want) in [(true, "a\r\nb\r\nc"), (false, "a\nb\nc")] {
+            for clip in ["a\nb\nc", "a\r\nb\r\nc", "a\r\nb\nc"] {
+                let mut e = Editor::new(9);
+                e.doc.crlf = doc_crlf;
+                e.paste(clip);
+                assert_eq!(text(&e), want, "pasting {clip:?} into a {} document", if doc_crlf { "CRLF" } else { "LF" });
+            }
+        }
+        // Paste replaces the selection, as typing does.
+        let mut e = Editor::new(10);
+        e.doc.crlf = false;
+        e.insert(b"hello world", false);
+        e.jump(0..5);
+        e.paste("bye");
+        assert_eq!(text(&e), "bye world");
     }
 }

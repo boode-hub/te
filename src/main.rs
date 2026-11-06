@@ -868,7 +868,7 @@ impl App {
                     self.ed().copy(&ctx, false);
                 }
                 if item(ui, "Paste", "Ctrl+V") {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                    self.paste();
                 }
                 if item(ui, "Delete", "Del")
                     && let Some(r) = self.tabs[self.cur()].selection()
@@ -963,30 +963,93 @@ impl App {
             });
             ui.menu_button("Encode", |ui| {
                 ui.weak("Works on the selection, or the whole file");
-                ui.menu_button("Encode", |ui| self.tool_items(ui, tools::ENCODE));
-                ui.menu_button("Decode", |ui| self.tool_items(ui, tools::DECODE));
-                ui.menu_button("Hash (copies to clipboard)", |ui| {
-                    for (name, f) in tools::HASH {
-                        if ui.button(*name).clicked() {
-                            match self.tabs[self.cur()].input() {
-                                Ok(b) => {
-                                    let h = f(&b);
-                                    ctx.copy_text(h.clone());
-                                    self.status = format!("{name} copied: {h}");
-                                }
-                                Err(e) => self.status = format!("{name}: {e}"),
-                            }
-                        }
-                    }
-                });
+                self.encode_items(ui);
             });
             ui.menu_button("Format", |ui| {
                 ui.weak("Works on the selection, or the whole file");
-                for (lang, items) in tools::FORMAT {
-                    ui.menu_button(*lang, |ui| self.tool_items(ui, items));
-                }
+                self.format_items(ui);
             });
         });
+    }
+
+    fn encode_items(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Encode", |ui| self.tool_items(ui, tools::ENCODE));
+        ui.menu_button("Decode", |ui| self.tool_items(ui, tools::DECODE));
+        ui.menu_button("Hash (copies to clipboard)", |ui| {
+            for (name, f) in tools::HASH {
+                if ui.button(*name).clicked() {
+                    match self.tabs[self.cur()].input() {
+                        Ok(b) => {
+                            let h = f(&b);
+                            ui.ctx().copy_text(h.clone());
+                            self.status = format!("{name} copied: {h}");
+                        }
+                        Err(e) => self.status = format!("{name}: {e}"),
+                    }
+                }
+            }
+        });
+    }
+
+    fn format_items(&mut self, ui: &mut egui::Ui) {
+        for (lang, items) in tools::FORMAT {
+            ui.menu_button(*lang, |ui| self.tool_items(ui, items));
+        }
+    }
+
+    /// Reads the clipboard directly, so menu Paste works no matter where keyboard focus is.
+    fn paste(&mut self) {
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(t) => self.ed().paste(&t),
+            Err(_) => self.status = "The clipboard has no text".into(),
+        }
+    }
+
+    /// Right-click menu in the editor. Tools act on the selection, or the whole file without one.
+    fn editor_menu(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let sel = self.tabs[self.cur()].selection().is_some();
+        if ui.add_enabled(sel, egui::Button::new("Cut").shortcut_text("Ctrl+X")).clicked() {
+            self.ed().copy(&ctx, true);
+        }
+        if ui.add_enabled(sel, egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+            self.ed().copy(&ctx, false);
+        }
+        if item(ui, "Paste", "Ctrl+V") {
+            self.paste();
+        }
+        if ui.add_enabled(sel, egui::Button::new("Delete").shortcut_text("Del")).clicked()
+            && let Some(r) = self.tabs[self.cur()].selection()
+        {
+            self.ed().delete(r);
+        }
+        if item(ui, "Select all", "Ctrl+A") {
+            self.ed().select_all();
+        }
+        if sel {
+            ui.separator();
+            if item(ui, "Find this in the file", "") {
+                self.open_find(Scope::File, false);
+                self.find_next(true);
+            }
+            if item(ui, "Search all open tabs for this", "") {
+                self.open_find(Scope::Tabs, false);
+                self.run_search();
+            }
+        }
+        ui.separator();
+        ui.weak(if sel { "On the selection" } else { "On the whole file" });
+        ui.menu_button("Change case", |ui| self.tool_items(ui, tools::CASE));
+        ui.menu_button("Lines", |ui| self.tool_items(ui, tools::LINES));
+        ui.menu_button("Encode / Decode / Hash", |ui| self.encode_items(ui));
+        ui.menu_button("Format", |ui| self.format_items(ui));
+        ui.separator();
+        if item(ui, "Duplicate line", "Ctrl+D") {
+            self.ed().duplicate_line();
+        }
+        if item(ui, "Delete line", "Ctrl+Shift+K") {
+            self.ed().delete_line();
+        }
     }
 
     fn tool_items(&mut self, ui: &mut egui::Ui, items: &[(&str, tools::Tool)]) {
@@ -1361,6 +1424,10 @@ impl App {
             let ed = &mut self.tabs[tab];
             let vs = self.views.entry((p, ed.id)).or_insert(PaneView { top: ed.top, scroll_x: ed.scroll_x });
             let resp = ed.draw(&mut child, &view, p == self.active, vs);
+            if resp.secondary_clicked() {
+                self.active = p;
+            }
+            resp.context_menu(|ui| self.editor_menu(ui));
             // `clicked` too: a fast click can press and release within one frame.
             if (resp.is_pointer_button_down_on() || resp.clicked()) && self.active != p {
                 self.active = p;
