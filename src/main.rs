@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 const THEMES: &[(&str, &str, &str)] = &[
+    ("Sharingan", "#0c0404", "#f0dada"),
     ("Midnight", "#1b1d23", "#d7dae0"),
     ("Paper", "#f7f4ec", "#2b2a27"),
     ("Nord", "#2e3440", "#d8dee9"),
@@ -30,8 +31,26 @@ const RECENT_MAX: usize = 12;
 /// Itachi's Mangekyou Sharingan, rendered from assets/logo/itachi.svg by build.rs (128x128 RGBA).
 const LOGO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo_128.rgba"));
 
+/// A preset theme. Sharingan (the default) gets crimson accents; the others derive everything
+/// from their background and text colours.
 fn preset(i: usize) -> Theme {
-    Theme::from_pair(Color32::from_hex(THEMES[i].1).unwrap(), Color32::from_hex(THEMES[i].2).unwrap())
+    let t = Theme::from_pair(Color32::from_hex(THEMES[i].1).unwrap(), Color32::from_hex(THEMES[i].2).unwrap());
+    if THEMES[i].0 != "Sharingan" {
+        return t;
+    }
+    let red = |hex: &str, a: u8| {
+        let c = Color32::from_hex(hex).unwrap();
+        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+    };
+    Theme {
+        cursor: red("#ff2b2b", 255),
+        selection: red("#c30000", 110),
+        line: red("#ff1a1a", 14),
+        numbers: red("#a04848", 255),
+        matches: red("#ff3b3b", 200),
+        bars: red("#170505", 255),
+        ..t
+    }
 }
 
 struct Settings {
@@ -776,7 +795,8 @@ impl App {
         if k(cmd, Key::Comma) {
             self.settings_open = !self.settings_open;
         }
-        if k(none, Key::Escape) {
+        // With a menu open, leave Esc to egui so it closes the menu.
+        if !egui::Popup::is_any_open(ctx) && k(none, Key::Escape) {
             if self.tabs[self.cur()].is_finding() {
                 self.ed().cancel_find(false);
             } else if self.goto.take().is_none() && !std::mem::take(&mut self.find_open) {
@@ -934,9 +954,9 @@ impl App {
                     self.settings_open = true;
                 }
                 ui.menu_button("Theme", |ui| {
-                    for (name, bg, fg) in THEMES {
+                    for (i, (name, _, _)) in THEMES.iter().enumerate() {
                         if ui.button(*name).clicked() {
-                            self.s.t = Theme::from_pair(Color32::from_hex(bg).unwrap(), Color32::from_hex(fg).unwrap());
+                            self.s.t = preset(i);
                         }
                     }
                 });
@@ -1596,11 +1616,11 @@ impl App {
         let dim = self.s.t.fg.gamma_multiply(0.5);
         ui.label(RichText::new("Presets").size(11.0).color(dim));
         ui.horizontal_wrapped(|ui| {
-            for (name, bg, fg) in THEMES {
-                let (bg, fg) = (Color32::from_hex(bg).unwrap(), Color32::from_hex(fg).unwrap());
-                let b = egui::Button::new(RichText::new(*name).color(fg).size(12.0)).fill(bg).corner_radius(6);
+            for (i, (name, _, _)) in THEMES.iter().enumerate() {
+                let t = preset(i);
+                let b = egui::Button::new(RichText::new(*name).color(if *name == "Sharingan" { t.cursor } else { t.fg }).size(12.0)).fill(t.bg).corner_radius(6);
                 if ui.add(b).clicked() {
-                    self.s.t = Theme::from_pair(bg, fg);
+                    self.s.t = t;
                 }
             }
         });

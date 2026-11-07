@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 420" width="1280" height="420">
+  <defs>
+    <radialGradient id="bg" cx="27%" cy="50%" r="80%">
+      <stop offset="0" stop-color="#3d0000"/>
+      <stop offset="0.45" stop-color="#140000"/>
+      <stop offset="1" stop-color="#050000"/>
+    </radialGradient>
+    <radialGradient id="iris">
+      <stop offset="0" stop-color="#660000"/>
+      <stop offset="0.5" stop-color="#c30000"/>
+      <stop offset="1" stop-color="#a00000"/>
+    </radialGradient>
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#ff1a1a" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#ff1a1a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="title" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff3b3b"/>
+      <stop offset="1" stop-color="#b30000"/>
+    </linearGradient>
+    <style>
+      .spin { transform-origin: 150px 150px; animation: spin 9s linear infinite; }
+      .pulse { transform-origin: 345px 210px; animation: pulse 3s ease-in-out infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @keyframes pulse { 50% { opacity: 0.55; transform: scale(1.06); } }
+      text { font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="420" fill="url(#bg)"/>
+  <g stroke="#ff2020" stroke-opacity="0.07" fill="none">
+    <circle cx="345" cy="210" r="190"/><circle cx="345" cy="210" r="250"/><circle cx="345" cy="210" r="320"/><circle cx="345" cy="210" r="400"/>
+  </g>
+  <circle class="pulse" cx="345" cy="210" r="190" fill="url(#glow)"/>
+
+  <!-- Itachi's Mangekyou Sharingan (Sharingan-Monitor's vector eyes, MIT) -->
+  <g transform="translate(205 70) scale(0.9333)">
+    <circle cx="150" cy="150" r="145" fill="url(#iris)" stroke="#000" stroke-width="10"/>
+    <path class="spin" fill="#000" d="M 177.6,10.7 C 135,68.4 155.4,100.7 179.8,118.5 C 260.9,160.6 274.8,214.5 255.9,244.9 C 237.3,191.9 198,172.4 158.5,194.9 C 86.9,238.6 40.7,231.2 15.7,196.6 C 58.2,203.1 109.1,193.5 107.9,128.3 C 109.5,97.6 111.5,16.6 177.6,10.7 z"/>
+    <circle cx="150" cy="150" r="20" fill="#a00000"/>
+  </g>
+
+  <text x="640" y="190" font-size="150" font-weight="800" letter-spacing="6" fill="url(#title)">te</text>
+  <text x="646" y="245" font-size="32" font-weight="600" fill="#f2dede">The text editor for huge files</text>
+  <text x="646" y="287" font-size="21" fill="#c9a3a3">Windows · written in Rust · opens a 1.5 GB log in half a second</text>
+
+  <g font-size="19" font-weight="700" fill="#fff">
+    <rect x="646" y="318" width="132" height="42" rx="21" fill="#8b0000" stroke="#ff3b3b" stroke-opacity="0.6"/>
+    <text x="712" y="345" text-anchor="middle">Open 2 GB</text>
+    <text x="798" y="346" fill="#ff3b3b" font-size="22">›</text>
+    <rect x="820" y="318" width="112" height="42" rx="21" fill="#8b0000" stroke="#ff3b3b" stroke-opacity="0.6"/>
+    <text x="876" y="345" text-anchor="middle">Search</text>
+    <text x="952" y="346" fill="#ff3b3b" font-size="22">›</text>
+    <rect x="974" y="318" width="92" height="42" rx="21" fill="#8b0000" stroke="#ff3b3b" stroke-opacity="0.6"/>
+    <text x="1020" y="345" text-anchor="middle">Split</text>
+  </g>
+  <text x="1090" y="345" font-size="17" fill="#c9a3a3">No installer. No freeze.</text>
+</svg>
