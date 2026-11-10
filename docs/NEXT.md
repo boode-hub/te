@@ -60,6 +60,11 @@ State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites
   the written parts are deleted; saving waits while a split runs. 1 GB into 50 MB parts: 2.0 s.
   Opt-in check: `TE_BENCH=file cargo test --release split_speed -- --ignored --nocapture`
 
+- Crash fix: a pane under 28 px tall (small window, big panels) panicked in the scrollbar clamp.
+  Panics are now caught per frame (te keeps running, status says so) and logged to te-crash.log
+  next to te.exe. `tests::monkey` drives the real UI headless with random input and window sizes
+  (TE_MONKEY_FRAMES=60000 for a long run; 60k frames clean).
+
 ## Open (pick up here)
 1. GUI-test by hand (not automatable while someone uses the PC): per-pane search, the colour dialog,
    divider dragging, independent scroll

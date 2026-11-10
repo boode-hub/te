@@ -28,6 +28,13 @@ const THEMES: &[(&str, &str, &str)] = &[
 ];
 const LAYOUTS: &[(&str, usize)] = &[("Single", 1), ("Two side by side", 2), ("Three side by side", 3), ("Grid of four", 4)];
 const RECENT_MAX: usize = 12;
+/// Off only in the headless UI test: no native dialogs, no Explorer, no real clipboard.
+static DIALOGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn dialogs() -> bool {
+    DIALOGS.load(Ordering::Relaxed)
+}
+
 /// Itachi's Mangekyou Sharingan, rendered from assets/logo/itachi.svg by build.rs (128x128 RGBA).
 const LOGO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo_128.rgba"));
 
@@ -455,15 +462,24 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext) -> App {
+        let mut app = App::with_ctx(&cc.egui_ctx);
+        for p in std::env::args_os().skip(1) {
+            let p = PathBuf::from(p);
+            if p.is_dir() { app.set_folder(p) } else { app.open_path(p) }
+        }
+        app
+    }
+
+    fn with_ctx(ctx: &egui::Context) -> App {
         let s = Settings::load();
-        apply_font(&cc.egui_ctx, &s.font_path);
-        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        let logo = cc.egui_ctx.load_texture(
+        apply_font(ctx, &s.font_path);
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        let logo = ctx.load_texture(
             "logo",
             egui::ColorImage::from_rgba_unmultiplied([128, 128], LOGO),
             egui::TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..egui::TextureOptions::LINEAR },
         );
-        let mut app = App {
+        App {
             tabs: vec![Editor::new(0)],
             next_id: 1,
             panes: vec![0],
@@ -505,12 +521,7 @@ impl App {
             status: String::new(),
             title: String::new(),
             logo,
-        };
-        for p in std::env::args_os().skip(1) {
-            let p = PathBuf::from(p);
-            if p.is_dir() { app.set_folder(p) } else { app.open_path(p) }
         }
-        app
     }
 
     // ---------- tabs and panes ----------
@@ -607,6 +618,9 @@ impl App {
     // ---------- files ----------
 
     fn open_dialog(&mut self) {
+        if !dialogs() {
+            return;
+        }
         let mut d = rfd::FileDialog::new();
         if let Some(dir) = self.tabs[self.cur()].path.as_ref().and_then(|p| p.parent()).or(self.folder.as_deref()) {
             d = d.set_directory(dir);
@@ -623,7 +637,9 @@ impl App {
     }
 
     fn open_folder(&mut self) {
-        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+        if dialogs()
+            && let Some(p) = rfd::FileDialog::new().pick_folder()
+        {
             self.set_folder(p);
         }
     }
@@ -1019,6 +1035,10 @@ impl App {
 
     /// Reads the clipboard directly, so menu Paste works no matter where keyboard focus is.
     fn paste(&mut self) {
+        if !dialogs() {
+            self.ed().paste("pasted\ntext");
+            return;
+        }
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             Ok(t) => self.ed().paste(&t),
             Err(_) => self.status = "The clipboard has no text".into(),
@@ -1364,15 +1384,18 @@ impl App {
             go = ui.add_enabled(len > 0 && dir.is_some(), egui::Button::new("Split")).clicked();
         });
         self.split_open = open;
-        if pick_dir && let Some(d) = rfd::FileDialog::new().pick_folder() {
+        if pick_dir && dialogs() && let Some(d) = rfd::FileDialog::new().pick_folder() {
             self.split_dir = Some(d);
         }
-        if let Some(d) = open_dir {
+        if let Some(d) = open_dir.filter(|_| dialogs()) {
             let _ = std::process::Command::new("explorer").arg(d).spawn();
         }
         let Some(dir) = dir.filter(|_| go) else { return };
         let est = split::estimate(len, max);
         if (1..=est).any(|i| dir.join(split::part_name(&name, i, est)).exists()) {
+            if !dialogs() {
+                return;
+            }
             let replace = rfd::MessageDialog::new()
                 .set_title("te")
                 .set_description("Part files with these names already exist in that folder. Replace them?")
@@ -1646,6 +1669,7 @@ impl App {
         });
         if let Some(i) = pick
             && let Some((_, _, c)) = self.s.t.slots().into_iter().nth(i)
+            && dialogs()
             && let Some(new) = pick_color(*c, &mut self.s.custom)
         {
             *c = new;
@@ -1674,7 +1698,9 @@ impl App {
             if ui.small_button("Fonts folder").on_hover_text("Drop .ttf / .otf files here, then Refresh").clicked() {
                 let dir = user_fonts_dir();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                if dialogs() {
+                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                }
             }
             if ui.small_button("Refresh").clicked() {
                 self.fonts.clear();
@@ -1753,7 +1779,7 @@ impl App {
                 Err(e) => self.status = format!("Couldn't load profile: {e}"),
             }
         }
-        if let Some(name) = delete {
+        if let Some(name) = delete.filter(|_| dialogs()) {
             let sure = rfd::MessageDialog::new()
                 .set_title("te")
                 .set_description(format!("Delete the profile \"{name}\"?"))
@@ -1795,7 +1821,22 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// A bug in one frame must not take unsaved work down with it: the panic is written to
+    /// te-crash.log (by the hook in `main`), that frame is dropped, and te keeps running.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.guarded_frame(ui);
+    }
+}
+
+impl App {
+    /// One frame, with any panic caught inside egui's frame so egui itself stays consistent.
+    fn guarded_frame(&mut self, ui: &mut egui::Ui) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.frame(ui))).is_err() {
+            self.status = "te hit an internal error (details in te-crash.log next to te.exe). Your text is safe: save your work.".into();
+        }
+    }
+
+    fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.sync_visuals(&ctx);
         for i in 0..self.tabs.len() {
@@ -1889,7 +1930,29 @@ impl eframe::App for App {
     }
 }
 
+/// Panics are otherwise silent (no console in the release build): append each one, with the
+/// source line it came from, to te-crash.log next to te.exe.
+fn log_panics() {
+    use std::sync::atomic::AtomicUsize;
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // A bug that fires every frame would fill the disk; the first few say everything.
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
+            let payload = info.payload();
+            let msg = payload.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_default();
+            let at = info.location().map_or(String::new(), |l| format!("{}:{}", l.file(), l.line()));
+            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let line = format!("[unix {secs}] te {} panicked at {at}: {msg}\n", env!("CARGO_PKG_VERSION"));
+            let path = std::env::current_exe().unwrap_or_default().with_file_name("te-crash.log");
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        }
+        default_hook(info);
+    }));
+}
+
 fn main() -> eframe::Result {
+    log_panics();
     let icon = egui::IconData { rgba: LOGO.to_vec(), width: 128, height: 128 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1970,5 +2033,137 @@ mod tests {
         assert_eq!((g[0].size(), g[3].size()), (vec2(250.0, 450.0), vec2(750.0, 150.0)));
         assert_eq!(equal_splits(3), [1.0 / 3.0, 2.0 / 3.0]);
         assert!(equal_splits(1).is_empty() && equal_splits(4) == [0.5]);
+    }
+
+    /// Monkey test: thousands of frames of random keys, typing, clicks, drags, wheel, clipboard
+    /// and window sizes (down to 0x0) through the real UI, headless. Any panic anywhere in te
+    /// fails the test with where it happened.
+    #[test]
+    fn monkey() {
+        use egui::{Event, Key as K, Modifiers as M, PointerButton, Pos2, RawInput};
+        DIALOGS.store(false, Ordering::Relaxed);
+        let panics = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = panics.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            // Only this test's thread and te's own unnamed worker threads (other tests panic on purpose).
+            let name = std::thread::current().name().map(String::from);
+            if name.as_deref().is_none_or(|n| n.contains("monkey")) {
+                let payload = info.payload();
+                let msg = payload.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_default();
+                let at = info.location().map_or(String::new(), |l| format!("{}:{}", l.file(), l.line()));
+                seen.lock().unwrap().push(format!("{at}: {msg}"));
+            }
+        }));
+
+        let dir = std::env::temp_dir().join("te_monkey");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let mut log = String::new();
+        for i in 0..40_000 {
+            log += &format!("{i:06}\tINFO [svc] héllo wörld ✓ 😀 request id={} ms={}\r\n", i * 7, i % 900);
+            if i == 777 {
+                log += &"x".repeat(30_000);
+                log += "\r\n";
+            }
+        }
+        let files = [("a.log", log.into_bytes()), ("b.json", br#"{"a":[1,{"b":"c"}],"d":{}}"#.to_vec()), ("empty.txt", Vec::new()), ("sub/c.txt", b"one\ntwo\n".to_vec())];
+        for (name, body) in &files {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let open_all = |app: &mut App| {
+            for (name, _) in &files {
+                app.open_path(dir.join(name));
+            }
+            app.set_folder(dir.clone());
+        };
+        open_all(&mut app);
+
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move |m: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % m.max(1) as u64) as usize
+        };
+        let keys = [
+            K::ArrowLeft, K::ArrowRight, K::ArrowUp, K::ArrowDown, K::PageUp, K::PageDown, K::Home, K::End, K::Enter, K::Tab,
+            K::Backspace, K::Delete, K::Escape, K::F3, K::A, K::Z, K::Y, K::D, K::K, K::F, K::H, K::G, K::B, K::N, K::T, K::W,
+            K::Backslash, K::Equals, K::Minus, K::Num0, K::Comma, K::S, K::C, K::V, K::X,
+        ];
+        let mods = [M::NONE, M::NONE, M::NONE, M::COMMAND, M::SHIFT, M::COMMAND | M::SHIFT];
+        let texts = ["a", "Z", "é", "😀", "\t", "ERROR", "  ", "(", "\\d+", "{\"x\":1}", "<a><b/></a>", "line\nbreak"];
+        let (mut size, mut time, mut down) = (egui::vec2(1200.0, 760.0), 0.0, false);
+        let frames: usize = std::env::var("TE_MONKEY_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(6000);
+        for frame in 0..frames {
+            if frame % 97 == 0 {
+                size = match rnd(6) {
+                    0 => egui::vec2(rnd(60) as f32, rnd(60) as f32),
+                    1 => egui::vec2(rnd(400) as f32, rnd(200) as f32),
+                    2 => egui::vec2(2400.0, 1400.0),
+                    _ => egui::vec2(1200.0, 760.0),
+                };
+            }
+            if frame % 600 == 599 {
+                open_all(&mut app);
+            }
+            let pos = Pos2::new(rnd(size.x as usize + 1) as f32, rnd(size.y as usize + 1) as f32);
+            let mut events = Vec::new();
+            for _ in 0..rnd(4) {
+                let m = mods[rnd(mods.len())];
+                match rnd(12) {
+                    0..=3 => {
+                        let key = keys[rnd(keys.len())];
+                        events.push(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: m });
+                        events.push(Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: m });
+                    }
+                    4 => events.push(Event::Text(texts[rnd(texts.len())].into())),
+                    5 => events.push(Event::PointerMoved(pos)),
+                    6 | 7 => {
+                        let button = if rnd(4) == 0 { PointerButton::Secondary } else { PointerButton::Primary };
+                        events.push(Event::PointerMoved(pos));
+                        down = !down || button == PointerButton::Secondary;
+                        events.push(Event::PointerButton { pos, button, pressed: true, modifiers: m });
+                        if rnd(2) == 0 {
+                            events.push(Event::PointerButton { pos, button, pressed: false, modifiers: m });
+                            down = false;
+                        }
+                    }
+                    8 => events.push(Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(rnd(200) as f32 - 100.0, rnd(2000) as f32 - 1000.0),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                        modifiers: m,
+                    }),
+                    9 => events.push([Event::Copy, Event::Cut, Event::Paste("p1\np2".into())][rnd(3)].clone()),
+                    10 if down => {
+                        events.push(Event::PointerMoved(pos));
+                        events.push(Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers: M::NONE });
+                        down = false;
+                    }
+                    _ => events.push(Event::PointerMoved(pos)),
+                }
+            }
+            time += 1.0 / 60.0;
+            let raw = RawInput { screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)), time: Some(time), events, focused: true, ..Default::default() };
+            // The same path as the real app: a panicking frame is caught and te carries on.
+            let _ = ctx.run_ui(raw, |ui| app.guarded_frame(ui));
+            if panics.lock().unwrap().len() > 30 {
+                break;
+            }
+            if frame % 50 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(2)); // let background loads finish
+            }
+        }
+        let _ = std::panic::take_hook();
+        let found = panics.lock().unwrap().clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut unique = found.clone();
+        unique.sort();
+        unique.dedup();
+        assert!(found.is_empty(), "{} panics, {} distinct:\n{}", found.len(), unique.len(), unique.join("\n"));
     }
 }

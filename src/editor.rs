@@ -162,6 +162,14 @@ fn find_sliced(doc: &Doc, re: &Regex, r: Range<usize>, forward: bool, cancel: &A
     Some(None)
 }
 
+/// Scrollbar thumb height for a track `track` points tall showing `rows` of `lines`: at least 28
+/// points when there's room, never taller than the track. A tiny or zero-height pane (a small
+/// window, big panels) must not panic, which `clamp(28.0, track)` did when track < 28.
+fn thumb_height(track: f32, rows: usize, lines: usize) -> f32 {
+    let track = track.max(0.0);
+    (track * rows as f32 / (lines + rows).max(1) as f32).max(28.0).min(track)
+}
+
 pub fn width(ctx: &egui::Context, font: &FontId, b: &[u8]) -> f32 {
     ctx.fonts_mut(|f| f.layout_no_wrap(display(b), font.clone(), Color32::WHITE).size().x)
 }
@@ -255,6 +263,9 @@ impl Editor {
         if !self.modified {
             return true;
         }
+        if !crate::dialogs() {
+            return true;
+        }
         use rfd::{MessageButtons, MessageDialogResult};
         match rfd::MessageDialog::new()
             .set_title("te")
@@ -269,6 +280,9 @@ impl Editor {
     }
 
     fn save_dialog(&self) -> Option<PathBuf> {
+        if !crate::dialogs() {
+            return None;
+        }
         let mut d = rfd::FileDialog::new().set_file_name(self.name());
         if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()) {
             d = d.set_directory(dir);
@@ -815,10 +829,10 @@ impl Editor {
 
         // Scrollbar
         let track = Rect::from_min_max(pos2(rect.right() - bar_w, rect.top()), rect.right_bottom());
-        let thumb_h = (rect.height() * rows as f32 / (lines + rows) as f32).clamp(28.0, rect.height());
+        let thumb_h = thumb_height(rect.height(), rows, lines);
         let bar = ui.interact(track, id.with("vbar"), Sense::click_and_drag());
         if let Some(p) = bar.interact_pointer_pos() {
-            let t = ((p.y - rect.top() - thumb_h / 2.0) / (rect.height() - thumb_h)).clamp(0.0, 1.0);
+            let t = ((p.y - rect.top() - thumb_h / 2.0) / (rect.height() - thumb_h).max(1.0)).clamp(0.0, 1.0);
             vs.top = t as f64 * max_top;
         }
         vs.top = vs.top.clamp(0.0, max_top);
@@ -1115,5 +1129,19 @@ mod tests {
         e.jump(0..5);
         e.paste("bye");
         assert_eq!(text(&e), "bye world");
+    }
+
+    #[test]
+    fn scrollbar_survives_tiny_panes() {
+        // The crash: a pane under 28 points tall (small window, big panels) panicked here.
+        for track in [0.0, 0.5, 1.0, 12.0, 27.9, 28.0, 29.0, 300.0, f32::MIN] {
+            for (rows, lines) in [(1, 1), (1, 12_000_000), (40, 40), (0, 0)] {
+                let h = thumb_height(track, rows, lines);
+                assert!(h >= 0.0 && h <= track.max(0.0), "track {track}, rows {rows}, lines {lines}: {h}");
+                if track >= 28.0 {
+                    assert!(h >= 28.0);
+                }
+            }
+        }
     }
 }
