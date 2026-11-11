@@ -10,6 +10,9 @@ env:
 
 jobs:
   release:
+    # Releases are published (and signed) from the public repository only; the private copy
+    # has no signing key, so a tag pushed there must not start a release.
+    if: github.repository == 'boode-hub/te'
     runs-on: windows-latest
     permissions:
       contents: write
