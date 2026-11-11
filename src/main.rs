@@ -4,6 +4,8 @@ mod editor;
 mod search;
 mod split;
 mod tools;
+mod update;
+mod updater;
 
 use editor::{Editor, PaneView, Theme, View};
 use eframe::egui::{self, Align2, Color32, FontFamily, FontId, Frame, Key, Modifiers, Rect, RichText, Sense, TextEdit, Vec2, pos2, vec2};
@@ -443,6 +445,9 @@ struct App {
     split_job: Option<split::Job>,
     /// Last finished split: how many files, and where (for the "Open folder" button).
     split_done: Option<(usize, PathBuf)>,
+    /// Help > Check for updates: the running check / download, if any.
+    updater: Option<updater::Updater>,
+    update_open: bool,
     fonts: Vec<(&'static str, String, String)>,
     font_filter: String,
     s: Settings,
@@ -462,6 +467,7 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext) -> App {
+        updater::clean_up_after_update();
         let mut app = App::with_ctx(&cc.egui_ctx);
         for p in std::env::args_os().skip(1) {
             let p = PathBuf::from(p);
@@ -508,6 +514,8 @@ impl App {
             split_dir: None,
             split_job: None,
             split_done: None,
+            updater: None,
+            update_open: false,
             fonts: Vec::new(),
             font_filter: String::new(),
             saved_cfg: s.serialize(),
@@ -1005,6 +1013,20 @@ impl App {
                 ui.weak("Works on the selection, or the whole file");
                 self.format_items(ui);
             });
+            ui.menu_button("Help", |ui| {
+                if item(ui, "Check for updates…", "") {
+                    self.updater = Some(updater::Updater::check(&ctx));
+                    self.update_open = true;
+                }
+                if item(ui, "te on GitHub", "") {
+                    open_url("https://github.com/boode-hub/te");
+                }
+                if item(ui, "Buy me a coffee", "") {
+                    open_url("https://buymeacoffee.com/boode");
+                }
+                ui.separator();
+                ui.weak(format!("te {}", env!("CARGO_PKG_VERSION")));
+            });
         });
     }
 
@@ -1327,6 +1349,100 @@ impl App {
             } else if ui.selectable_label(current.as_ref() == Some(&path), &name).clicked() {
                 *open = Some(path);
             }
+        }
+    }
+
+    /// Help > Check for updates: what the check found, and the way to install it safely.
+    fn update_window(&mut self, ctx: &egui::Context) {
+        let Some(u) = self.updater.clone() else { return };
+        let state = u.state();
+        let mut open = self.update_open;
+        let (mut install, mut again, mut restart) = (None, false, false);
+        let unsaved = self.tabs.iter().any(|t| t.modified);
+        egui::Window::new("Updates").open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_TOP, [0.0, 80.0]).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            let current = update::Version::current();
+            match &state {
+                updater::State::Checking => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Checking GitHub for a newer te…");
+                    });
+                }
+                updater::State::UpToDate(v) => {
+                    ui.label(format!("te {v} is the latest version."));
+                }
+                updater::State::Available(r) => {
+                    ui.label(RichText::new(format!("te {} is available", r.version)).strong());
+                    ui.weak(format!("You have {current}. The download is checked against te's signature before anything changes."));
+                    if !r.notes.trim().is_empty() {
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            ui.label(r.notes.trim());
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Download and install").clicked() {
+                            install = Some(r.clone());
+                        }
+                        if ui.button("Release page").clicked() {
+                            open_url(&r.page);
+                        }
+                    });
+                }
+                updater::State::NoBuild(r) => {
+                    ui.label(format!("te {} is out, but without a download te can install itself.", r.version));
+                    if ui.button("Release page").clicked() {
+                        open_url(&r.page);
+                    }
+                }
+                updater::State::Downloading { version, done, total } => {
+                    ui.label(format!("Downloading te {version}…"));
+                    let p = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
+                    ui.add(egui::ProgressBar::new(p.min(1.0)).show_percentage());
+                }
+                updater::State::Testing(v) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Signature and checksum OK. Testing te {v} before installing it…"));
+                    });
+                }
+                updater::State::Installed(v) => {
+                    ui.label(RichText::new(format!("te {v} is installed.")).strong());
+                    ui.weak("It starts the next time you open te. The previous version is kept as te.old.exe until then.");
+                    if unsaved {
+                        ui.weak("Save your work, then restart.");
+                    }
+                    restart = ui.add_enabled(!unsaved, egui::Button::new("Restart te now")).clicked();
+                }
+                updater::State::Failed(e) => {
+                    ui.label(format!("Couldn't update: {e}"));
+                    ui.weak("Nothing was changed.");
+                    ui.horizontal(|ui| {
+                        again = ui.button("Try again").clicked();
+                        if ui.button("Release page").clicked() {
+                            open_url(update::RELEASES_PAGE);
+                        }
+                    });
+                }
+            }
+        });
+        self.update_open = open;
+        if matches!(state, updater::State::Checking | updater::State::Downloading { .. } | updater::State::Testing(_)) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if let Some(r) = install {
+            u.install(ctx, r);
+        }
+        if again {
+            self.updater = Some(updater::Updater::check(ctx));
+        }
+        if restart
+            && dialogs()
+            && let Ok(exe) = std::env::current_exe().map(|e| e.with_file_name(update::PROGRAM))
+            && std::process::Command::new(exe).spawn().is_ok()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -1917,6 +2033,9 @@ impl App {
         if self.split_open {
             self.split_window(&ctx);
         }
+        if self.update_open {
+            self.update_window(&ctx);
+        }
         if self.settings_open {
             self.settings(&ctx);
         }
@@ -1951,8 +2070,123 @@ fn log_panics() {
     }));
 }
 
+/// Opens a web page in the default browser.
+fn open_url(url: &str) {
+    if dialogs() {
+        let _ = std::process::Command::new("explorer").arg(url).spawn();
+    }
+}
+
+/// `te --self-test`: what an update runs on the new program before it replaces the old one.
+/// Exercises the parts a broken build would trip over, without opening a window.
+fn self_test() -> Result<(), String> {
+    for (_, name, bytes) in BUNDLED {
+        skrifa::FontRef::from_index(bytes, 0).map_err(|e| format!("built-in font {name} is damaged: {e}"))?;
+    }
+    if LOGO.len() != 128 * 128 * 4 {
+        return Err("the logo is damaged".into());
+    }
+    let dir = std::env::temp_dir().join(format!("te-self-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let file = dir.join("check.json");
+    let result = (|| {
+        std::fs::write(&file, br#"{"a":[1,2,{"b":"c"}]}"#).map_err(|e| e.to_string())?;
+        let mut e = Editor::open(0, file.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while e.poll().is_none() {
+            if std::time::Instant::now() > deadline || e.msg.is_some() {
+                return Err(format!("opening a file failed: {:?}", e.msg));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        e.select_all();
+        e.transform("pretty", tools::FORMAT[0].1[0].1);
+        let re = Query { text: "\"b\"".into(), case: true, ..Default::default() }.build()?;
+        if !e.find_next(&re, true) || !e.save(false) {
+            return Err(format!("editing failed: {:?}", e.msg));
+        }
+        while e.poll().is_none() {
+            if std::time::Instant::now() > deadline {
+                return Err("reopening after save failed".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let saved = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
+        if !saved.contains("\n    \"a\": [") {
+            return Err("save wrote the wrong text".into());
+        }
+        // One frame of the real UI, headless.
+        DIALOGS.store(false, Ordering::Relaxed);
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        app.open_path(file.clone());
+        for _ in 0..3 {
+            let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 760.0))), ..Default::default() }, |ui| app.frame(ui));
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// Command-line modes that run without a window. Returns the exit code, or None to start the GUI.
+fn command_line() -> Option<i32> {
+    let arg = std::env::args().nth(1)?;
+    let say = |line: String| {
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), "{line}");
+    };
+    match arg.as_str() {
+        "--self-test" => Some(match self_test() {
+            Ok(()) => {
+                say(format!("te {} self-test ok", env!("CARGO_PKG_VERSION")));
+                0
+            }
+            Err(e) => {
+                eprintln!("self-test failed: {e}");
+                1
+            }
+        }),
+        "--install-update" => {
+            attach_console();
+            Some(match updater::install_from_command_line() {
+                Ok(msg) => {
+                    say(msg);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("update failed: {e}");
+                    1
+                }
+            })
+        }
+        "--version" => {
+            attach_console();
+            say(format!("te {}", env!("CARGO_PKG_VERSION")));
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+/// te is a window program, so it has no console of its own; borrow the one it was started from,
+/// if any, so command-line modes can be read.
+fn attach_console() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(pid: u32) -> i32;
+    }
+    // SAFETY: plain Win32 call; ATTACH_PARENT_PROCESS.
+    unsafe { AttachConsole(u32::MAX) };
+}
+
 fn main() -> eframe::Result {
+    updater::remember_program();
     log_panics();
+    if let Some(code) = command_line() {
+        std::process::exit(code);
+    }
     let icon = egui::IconData { rgba: LOGO.to_vec(), width: 128, height: 128 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

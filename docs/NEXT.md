@@ -65,6 +65,18 @@ State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites
   next to te.exe. `tests::monkey` drives the real UI headless with random input and window sizes
   (TE_MONKEY_FRAMES=60000 for a long run; 60k frames clean).
 
+- Updates (same design as BDF): Help > Check for updates and `te --install-update`. Releases
+  carry SHA256SUMS.txt + an Ed25519 signature; te installs only when the signature matches the
+  public key in src/update.rs, the zip matches its checksum, and the new exe passes `--self-test`;
+  the old exe stays as te.old.exe until the new one starts. End-to-end tested locally (0.1.9 ->
+  0.2.0, tampered zip and impostor key refused).
+
+## Releasing (signed)
+- The private signing key is at ~/.te-release/te-signing-key.pem (never in a repo); keep a backup.
+  It must also be the `TE_SIGNING_KEY` secret on boode-hub/te.
+- Bump `version` in Cargo.toml, commit, then: `git tag vX.Y.Z && git push public master vX.Y.Z`.
+  .github/workflows/release.yml lints, tests, builds, self-tests, packages, signs and publishes.
+
 ## Open (pick up here)
 1. GUI-test by hand (not automatable while someone uses the PC): per-pane search, the colour dialog,
    divider dragging, independent scroll

@@ -74,7 +74,7 @@ That's it. Open a file with **File > Open**, by dropping it on the window, or wi
 | **Fast** | A 1.5 GB, 12-million-line log opens in about 0.4 s. Jumping to any line takes microseconds, and regex search runs at over 1 GB/s. |
 | **Never freezes** | Opening, searching big files, searching whole folders and splitting all run in the background. The window keeps drawing; Esc cancels. |
 | **Light** | Files are memory-mapped, not loaded. Five 1.5 GB files open at once cost about 30 MB of te's own memory. Idle CPU is zero: te only draws when something changes. |
-| **Safe** | Saves go to a temporary file that replaces the original only once it is complete, so a failed save never damages your file. Files under 64 MB are never locked while open. |
+| **Safe** | Saves go to a temporary file that replaces the original only once it is complete, so a failed save never damages your file. Files under 64 MB are never locked while open. Updates are signed, checksummed and self-tested before they replace anything. |
 | **Portable** | One exe. Settings sit next to it, so te travels on a USB stick. |
 
 <p align="center"><img src="docs/divider.png" width="900" alt=""></p>
@@ -113,6 +113,7 @@ That's it. Open a file with **File > Open**, by dropping it on the window, or wi
 | Formatters | JSON (pretty, minify, to YAML / TOML / CSV, big numbers and key order kept), XML and HTML (pretty, minify, tolerant of broken markup), YAML, TOML, SQL, CSV / TSV (align as a table, to JSON) |
 | Split into parts | File > Split into parts: numbered files of at most N bytes, KB, MB or GB, cut after full lines, for upload limits |
 | Files | Open recent, open folder (side panel), reload, save as, save a copy, save all, drag and drop |
+| Updates | Help > Check for updates: installs only releases signed with te's key, after checking the download's checksum and test-running the new version; the old one is kept until the new one has started |
 | Looks | Sharingan crimson and black by default; 8 presets; every colour mappable with the Windows colour picker; 24 built-in fonts from pixel and sci-fi to coding fonts, plus every installed font; saved profiles; Itachi's Mangekyou logo |
 
 <p align="center"><img src="docs/divider.png" width="900" alt=""></p>
@@ -199,6 +200,8 @@ src/editor.rs   one tab: cursor, selection, undo, find, save, drawing
 src/search.rs   find options and the background search across tabs or a folder
 src/tools.rs    encoders, decoders, hashes, formatters, line tools
 src/split.rs    split into parts
+src/update.rs   update checks: version, Ed25519 signature, checksum, safe swap
+src/updater.rs  Help > Check for updates: GitHub, download, self-test
 src/main.rs     the window: menus, tabs, panes, panels, appearance, settings
 build.rs        renders the Mangekyou logo into the exe icon
 ```

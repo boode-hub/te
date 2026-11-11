@@ -1,0 +1,84 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching Cargo.toml) to build, test, sign and publish that release.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: The tag is the version in Cargo.toml
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Lint
+        run: cargo clippy --release --all-targets -- -D warnings
+      - name: Tests (piece table, search, tools, editor, updater, headless UI monkey test)
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: The new program passes its own self-test
+        run: |
+          out="$(target/release/te.exe --self-test)"
+          echo "$out"
+          [ "$out" = "te $VERSION self-test ok" ]
+
+      - name: Package portable zip
+        run: |
+          name="te-$VERSION-win-x64"
+          mkdir -p "dist/$name/licenses"
+          cp target/release/te.exe packaging/README.txt "dist/$name/"
+          cp assets/fonts/OFL.txt assets/fonts/APACHE-LICENSE.txt "dist/$name/licenses/"
+          cp assets/logo/SOURCE.txt "dist/$name/licenses/logo.txt"
+          # Python writes forward-slash paths, which every unzip (and te's updater) reads the same way.
+          (cd dist && python -c "import shutil; shutil.make_archive('$name', 'zip', '.', '$name')")
+          mkdir -p upload && cp "dist/$name.zip" upload/
+          # Lets anyone confirm a download is intact, offline: sha256sum -c SHA256SUMS.txt
+          (cd upload && sha256sum *.zip > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Sign the checksums
+        # te's "Check for updates" installs nothing that is not signed with this key; the public
+        # half is built into the program (src/update.rs).
+        env:
+          TE_SIGNING_KEY: ${{ secrets.TE_SIGNING_KEY }}
+        run: |
+          if [ -z "$TE_SIGNING_KEY" ]; then
+            echo "::error::The TE_SIGNING_KEY secret is missing: releases must be signed"; exit 1
+          fi
+          umask 077
+          printf '%s\n' "$TE_SIGNING_KEY" > key.pem
+          trap 'rm -f key.pem pub.pem' EXIT
+          openssl pkey -in key.pem -pubout -out pub.pem
+          have="$(openssl pkey -pubin -in pub.pem -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n\r')"
+          want="$(grep -o 'PUBLIC_KEY_HEX: &str = "[0-9a-f]*"' src/update.rs | cut -d'"' -f2)"
+          if [ "$have" != "$want" ]; then
+            echo "::error::The signing key does not match the public key built into te"; exit 1
+          fi
+          openssl pkeyutl -sign -inkey key.pem -rawin -in upload/SHA256SUMS.txt -out upload/SHA256SUMS.txt.sig
+          openssl pkeyutl -verify -pubin -inkey pub.pem -rawin -in upload/SHA256SUMS.txt -sigfile upload/SHA256SUMS.txt.sig
+          ls -l upload
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*
+          generate_release_notes: true
