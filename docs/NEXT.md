@@ -71,6 +71,11 @@ State (2026-10-28, later): builds clean, `cargo test --release` passes (4 suites
   the old exe stays as te.old.exe until the new one starts. End-to-end tested locally (0.1.9 ->
   0.2.0, tampered zip and impostor key refused).
 
+## Housekeeping (always, after every task and every push)
+- Keep the newest exe in dist/te.exe, then `cargo clean` (target/ grows to ~2 GB per build cycle).
+- Delete test data, demo files, release staging folders, recordings and scratch files.
+- Finish with `du -sh .`: the project folder should be ~30 MB.
+
 ## Releasing (signed)
 - The private signing key is at ~/.te-release/te-signing-key.pem (never in a repo); keep a backup.
   It must also be the `TE_SIGNING_KEY` secret on boode-hub/te.
