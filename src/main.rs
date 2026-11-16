@@ -463,12 +463,22 @@ struct App {
     status: String,
     title: String,
     logo: egui::TextureHandle,
+    /// Where the open tabs are remembered (session\ next to te.exe); None in tests.
+    session: Option<PathBuf>,
+    session_saved: String,
+    session_at: std::time::Instant,
+    /// Edit count of each new tab's text as last written to the session folder.
+    backed_up: HashMap<u64, u64>,
+    /// The tab being renamed: its id, the name typed so far, and whether to focus the box.
+    renaming: Option<(u64, String, bool)>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext) -> App {
         updater::clean_up_after_update();
         let mut app = App::with_ctx(&cc.egui_ctx);
+        app.session = Some(std::env::current_exe().unwrap_or_default().with_file_name("session"));
+        app.restore_session();
         for p in std::env::args_os().skip(1) {
             let p = PathBuf::from(p);
             if p.is_dir() { app.set_folder(p) } else { app.open_path(p) }
@@ -529,6 +539,11 @@ impl App {
             status: String::new(),
             title: String::new(),
             logo,
+            session: None,
+            session_saved: String::new(),
+            session_at: std::time::Instant::now(),
+            backed_up: HashMap::new(),
+            renaming: None,
         }
     }
 
@@ -670,6 +685,118 @@ impl App {
         for e in self.tabs.iter_mut().filter(|e| e.modified && e.path.is_some()) {
             e.save(false);
         }
+    }
+
+    /// Remembers the open tabs in `session\tabs.json`, and the text of new tabs not saved yet as
+    /// `session\<id>.txt`, so te reopens as it was left. At most every 2 seconds; `now` at exit.
+    fn save_session(&mut self, ctx: &egui::Context, now: bool) {
+        let Some(dir) = self.session.clone() else { return };
+        let (mut tabs, mut index, mut backups) = (Vec::new(), vec![None; self.tabs.len()], Vec::new());
+        for (i, e) in self.tabs.iter().enumerate() {
+            let (cursor, top) = e.view();
+            let mut t = serde_json::json!({ "name": e.title, "cursor": cursor, "top": top });
+            if let Some(p) = e.file() {
+                t["path"] = p.to_string_lossy().into_owned().into();
+            } else if e.doc.len() > 0 {
+                if self.backed_up.get(&e.id) != Some(&e.edits) {
+                    backups.push(i);
+                }
+                t["text"] = format!("{}.txt", e.id).into();
+            } else if e.title.is_none() {
+                continue; // an empty new tab: nothing to keep
+            }
+            index[i] = Some(tabs.len());
+            tabs.push(t);
+        }
+        let panes: Vec<usize> = self.panes.iter().filter_map(|&p| index[p]).collect();
+        let json = serde_json::json!({ "tabs": tabs, "panes": panes, "active": self.active, "splits": self.splits, "split_y": self.split_y }).to_string();
+        if json == self.session_saved && backups.is_empty() {
+            return;
+        }
+        let wait = std::time::Duration::from_secs(2).saturating_sub(self.session_at.elapsed());
+        if !now && !wait.is_zero() {
+            ctx.request_repaint_after(wait);
+            return;
+        }
+        self.session_at = std::time::Instant::now();
+        // Each file is written beside its old copy and then swapped in, so a crash mid-write
+        // never leaves a half-written one.
+        let write = |name: &str, f: &dyn Fn(&Path) -> std::io::Result<()>| {
+            let tmp = dir.join(format!("{name}.tmp"));
+            f(&tmp).and_then(|()| std::fs::rename(&tmp, dir.join(name)))
+        };
+        // ponytail: written on the UI thread; move to a thread if huge unsaved tabs make typing stutter.
+        let result = std::fs::create_dir_all(&dir).and_then(|()| {
+            for &i in &backups {
+                let e = &self.tabs[i];
+                write(&format!("{}.txt", e.id), &|p| e.doc.write_to(p))?;
+            }
+            write("tabs.json", &|p| std::fs::write(p, &json))?;
+            // Text of tabs closed or saved to a file since.
+            let keep: Vec<String> = self.tabs.iter().filter(|e| e.file().is_none()).map(|e| format!("{}.txt", e.id)).collect();
+            for f in std::fs::read_dir(&dir)?.flatten() {
+                let n = f.file_name().to_string_lossy().into_owned();
+                if n.ends_with(".txt") && !keep.contains(&n) {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                for &i in &backups {
+                    self.backed_up.insert(self.tabs[i].id, self.tabs[i].edits);
+                }
+                self.session_saved = json;
+            }
+            Err(e) => self.status = format!("Couldn't remember the open tabs in {}: {e}", dir.display()),
+        }
+    }
+
+    /// Reopens the tabs open when te last closed (files that still exist, and new tabs' text).
+    fn restore_session(&mut self) {
+        let Some(dir) = self.session.clone() else { return };
+        let Some(v) = std::fs::read(dir.join("tabs.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { return };
+        let saved = v["tabs"].as_array().cloned().unwrap_or_default();
+        // New tabs keep their id, which names their text file; everything else gets a fresh one.
+        let old_id = |t: &serde_json::Value| t["text"].as_str().and_then(|f| f.strip_suffix(".txt")?.parse::<u64>().ok());
+        self.next_id = self.next_id.max(saved.iter().filter_map(old_id).max().map_or(0, |m| m + 1));
+        let (mut tabs, mut index) = (Vec::new(), Vec::new());
+        for t in &saved {
+            let (cursor, top) = (t["cursor"].as_u64().unwrap_or(0) as usize, t["top"].as_f64().unwrap_or(0.0));
+            let mut e = if let Some(p) = t["path"].as_str().map(PathBuf::from) {
+                if !p.is_file() {
+                    index.push(None); // moved or deleted since
+                    continue;
+                }
+                self.next_id += 1;
+                Editor::open_at(self.next_id - 1, p, cursor, top)
+            } else if let Some(id) = old_id(t) {
+                let Ok(text) = std::fs::read(dir.join(format!("{id}.txt"))) else {
+                    index.push(None);
+                    continue;
+                };
+                self.backed_up.insert(id, 0);
+                Editor::untitled(id, &text, cursor, top)
+            } else {
+                self.next_id += 1;
+                Editor::new(self.next_id - 1)
+            };
+            e.title = t["name"].as_str().map(String::from);
+            index.push(Some(tabs.len()));
+            tabs.push(e);
+        }
+        if tabs.is_empty() {
+            return;
+        }
+        self.tabs = tabs;
+        let panes: Vec<usize> = v["panes"].as_array().into_iter().flatten().filter_map(|p| *index.get(p.as_u64()? as usize)?).take(4).collect();
+        self.panes = if panes.is_empty() { vec![0] } else { panes };
+        let n = self.panes.len();
+        let splits: Vec<f32> = v["splits"].as_array().into_iter().flatten().filter_map(|s| Some((s.as_f64()? as f32).clamp(0.05, 0.95))).collect();
+        self.splits = if splits.len() == equal_splits(n).len() { splits } else { equal_splits(n) };
+        self.split_y = v["split_y"].as_f64().map_or(0.5, |y| (y as f32).clamp(0.05, 0.95));
+        self.active = (v["active"].as_u64().unwrap_or(0) as usize).min(n - 1);
     }
 
     fn add_recent(&mut self, p: &Path) {
@@ -821,7 +948,9 @@ impl App {
         }
         // With a menu open, leave Esc to egui so it closes the menu.
         if !egui::Popup::is_any_open(ctx) && k(none, Key::Escape) {
-            if self.tabs[self.cur()].is_finding() {
+            if self.renaming.is_some() {
+                self.renaming = None;
+            } else if self.tabs[self.cur()].is_finding() {
                 self.ed().cancel_find(false);
             } else if self.goto.take().is_none() && !std::mem::take(&mut self.find_open) {
                 self.settings_open = false;
@@ -1124,32 +1253,56 @@ impl App {
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         let (fg, cur) = (self.s.t.fg, self.cur());
-        let (mut show, mut close, mut add, mut to_pane) = (None, None, false, None);
+        let (mut show, mut close, mut add, mut to_pane, mut rename, mut renamed) = (None, None, false, None, None, false);
         egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 for (i, t) in self.tabs.iter().enumerate() {
+                    if let Some((id, text, focus)) = &mut self.renaming
+                        && *id == t.id
+                    {
+                        let out = TextEdit::singleline(text).desired_width(150.0).font(FontId::proportional(13.0)).show(ui);
+                        if std::mem::take(focus) {
+                            out.response.request_focus();
+                            let mut state = out.state;
+                            let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()));
+                            state.cursor.set_char_range(Some(all));
+                            state.store(ui.ctx(), out.response.id);
+                        }
+                        // Enter or clicking elsewhere keeps the name; Esc (in `shortcuts`) drops it.
+                        renamed = out.response.lost_focus();
+                        ui.add_space(6.0);
+                        continue;
+                    }
                     let on_screen = self.panes.contains(&i);
                     let label = format!("{}{}", t.name(), if t.modified { " •" } else { "" });
                     let color = if i == cur { fg } else if on_screen { fg.gamma_multiply(0.75) } else { fg.gamma_multiply(0.5) };
                     let r = ui.selectable_label(i == cur, RichText::new(label).color(color).size(13.0));
-                    let r = r.on_hover_text(t.path.as_ref().map_or("not saved yet".into(), |p| p.display().to_string()));
+                    let where_ = t.file().map_or("not saved yet".into(), |p| p.display().to_string());
+                    let r = r.on_hover_text(format!("{where_}\nDouble-click to rename"));
                     if r.clicked() {
                         show = Some(i);
+                    }
+                    if r.double_clicked() {
+                        rename = Some(i);
                     }
                     if r.middle_clicked() {
                         close = Some(i);
                     }
-                    if self.panes.len() > 1 {
-                        r.context_menu(|ui| {
+                    r.context_menu(|ui| {
+                        if ui.button("Rename tab").clicked() {
+                            rename = Some(i);
+                        }
+                        if self.panes.len() > 1 {
+                            ui.separator();
                             ui.weak("Show in");
                             for p in 0..self.panes.len() {
                                 if ui.button(pane_name(self.panes.len(), p)).clicked() {
                                     to_pane = Some((i, p));
                                 }
                             }
-                        });
-                    }
+                        }
+                    });
                     if ui.add(egui::Button::new(RichText::new("×").size(13.0).color(fg.gamma_multiply(0.4))).frame(false)).clicked() {
                         close = Some(i);
                     }
@@ -1162,6 +1315,20 @@ impl App {
         });
         if let Some(i) = show {
             self.show_tab(i);
+        }
+        if renamed && let Some((id, text, _)) = self.renaming.take()
+            && let Some(e) = self.tabs.iter_mut().find(|e| e.id == id)
+        {
+            // Empty, or the file's own name, goes back to following the file name.
+            e.title = None;
+            let text = text.trim();
+            if !text.is_empty() && text != e.name() {
+                e.title = Some(text.to_string());
+            }
+        }
+        if let Some(i) = rename {
+            self.show_tab(i);
+            self.renaming = Some((self.tabs[i].id, self.tabs[i].name(), true));
         }
         if let Some((i, p)) = to_pane {
             self.panes[p] = i;
@@ -1971,8 +2138,9 @@ impl App {
                 job.cancel();
                 let _ = job.join(); // deletes the parts it wrote
             }
+            // New tabs not saved yet come back with the session; edited files are asked about.
             for i in 0..self.tabs.len() {
-                if self.tabs[i].modified {
+                if self.tabs[i].modified && (self.tabs[i].file().is_some() || self.session.is_none()) {
                     self.show_tab(i);
                     if !self.tabs[i].confirm_discard() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1980,6 +2148,7 @@ impl App {
                     }
                 }
             }
+            self.save_session(&ctx, true);
         }
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>());
         if !dropped.is_empty()
@@ -2046,6 +2215,7 @@ impl App {
             let _ = std::fs::write(Settings::path(), &cfg);
             self.saved_cfg = cfg;
         }
+        self.save_session(&ctx, false);
     }
 }
 
@@ -2230,6 +2400,55 @@ mod tests {
         let manifest = include_str!("../Cargo.toml");
         let eframe = manifest.lines().find(|l| l.starts_with("eframe")).unwrap();
         assert!(eframe.contains("\"clipboard\""), "eframe must keep the clipboard feature: {eframe}");
+    }
+
+    /// Closing te and starting it again brings back the same tabs: files, new tabs' unsaved text,
+    /// names given to tabs, cursors and the split layout.
+    #[test]
+    fn session_round_trip() {
+        let dir = std::env::temp_dir().join(format!("te-session-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "line one\nline two\n").unwrap();
+        let ctx = egui::Context::default();
+        let session = dir.join("session");
+
+        let mut a = App::with_ctx(&ctx);
+        a.session = Some(session.clone());
+        a.ed().insert(b"draft text", false); // tab 0: new, never saved
+        a.tabs[0].title = Some("ideas".into());
+        a.open_path(file.clone()); // tab 1
+        a.new_tab(); // tab 2: empty and unnamed, not worth keeping
+        a.set_layout(2);
+        a.panes = vec![1, 0];
+        a.save_session(&ctx, true);
+        assert!(session.join(format!("{}.txt", a.tabs[0].id)).is_file());
+
+        let mut b = App::with_ctx(&ctx);
+        b.session = Some(session.clone());
+        b.restore_session();
+        let names: Vec<String> = b.tabs.iter().map(|e| e.name()).collect();
+        assert_eq!(names, ["ideas", "notes.txt"]);
+        assert_eq!(b.tabs[0].doc.bytes(0..b.tabs[0].doc.len()), b"draft text");
+        assert!(b.tabs[0].modified && b.tabs[0].cursor == 10);
+        assert_eq!(b.tabs[1].file(), Some(&file));
+        assert_eq!(b.panes, [1, 0]);
+        // Fresh ids never reuse a kept tab's, whose text file would be overwritten.
+        assert!(b.next_id > b.tabs[0].id && b.tabs[1].id != b.tabs[0].id);
+
+        // Saving a new tab to a file: its kept text goes; nothing stale is left behind.
+        b.tabs[0].path = Some(dir.join("ideas.txt"));
+        b.save_session(&ctx, true);
+        let left: Vec<_> = std::fs::read_dir(&session).unwrap().flatten().map(|f| f.file_name()).collect();
+        assert_eq!(left, ["tabs.json"]);
+
+        // A renamed tab offers its name to Save As; clearing the name follows the file again.
+        let mut e = Editor::new(9);
+        assert_eq!(e.name(), "untitled");
+        e.title = Some("report.md".into());
+        assert!(e.name() == "report.md" && !e.is_pristine());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

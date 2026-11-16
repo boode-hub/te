@@ -6,6 +6,8 @@ Open:       File > Open, drop a file on the window, or "Open with > te" in Explo
 Update:     Help > Check for updates. Only releases signed with te's key are installed;
             the previous version is kept as te.old.exe until the new one has started.
 Settings:   te.cfg next to te.exe (created on first run); saved looks go in profiles\
+Tabs:       te reopens with the tabs you left open; new tabs not saved yet are kept in session\.
+            Double-click a tab to rename it; Save As offers that name.
 Own fonts:  put .ttf / .otf files in a fonts\ folder next to te.exe
 Crashes:    if anything goes wrong, details are written to te-crash.log next to te.exe
 Uninstall:  delete this folder

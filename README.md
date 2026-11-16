@@ -106,7 +106,7 @@ That's it. Open a file with **File > Open**, by dropping it on the window, or wi
 |---|---|
 | Huge files | Multi-gigabyte files open in a blink and scroll smoothly; 100 MB single-line files (minified JSON) open in 20 ms |
 | Editing | Typing, selection, copy / cut / paste, undo and redo, duplicate and delete line, change case, sort, dedupe, trim and join lines, CRLF or LF |
-| Tabs and split view | Tabs, plus 2, 3 or 4 panes side by side or in a grid; drag the dividers to resize; drop a file onto the pane it should open in; right-click a tab to send it to a pane |
+| Tabs and split view | Tabs, plus 2, 3 or 4 panes side by side or in a grid; drag the dividers to resize; drop a file onto the pane it should open in; right-click a tab to send it to a pane; double-click a tab to rename it (Save As offers that name); te reopens with the tabs you left open, unsaved new tabs included |
 | Search | Find bar with match case, whole word and regex; replace one or all with `$1` groups; search this file, all open tabs or a whole folder in the background; a quick search box in each split pane |
 | Encode and decode | Base64, Base64 URL-safe, Base32, hex, URL, HTML entities, `\uXXXX`, string escape and unescape, binary, ROT13, JWT |
 | Hashes | MD5, SHA-1, SHA-256, SHA-512, CRC32, copied to the clipboard |

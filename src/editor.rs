@@ -88,6 +88,11 @@ pub struct Editor {
     pub id: u64,
     pub doc: Doc,
     pub path: Option<PathBuf>,
+    /// A name given to the tab (double-click it); shown instead of the file name and offered as
+    /// the file name by Save As.
+    pub title: Option<String>,
+    /// Counts edits, so the session knows when an unsaved new tab's text needs backing up again.
+    pub edits: u64,
     pub loading: Option<Loading>,
     /// Selection and scroll to apply once loading finishes.
     restore: Option<(Range<usize>, f64)>,
@@ -180,6 +185,8 @@ impl Editor {
             id,
             doc: Doc::new(),
             path: None,
+            title: None,
+            edits: 0,
             loading: None,
             restore: None,
             modified: false,
@@ -200,19 +207,50 @@ impl Editor {
     }
 
     pub fn open(id: u64, path: PathBuf) -> Editor {
+        Editor::open_at(id, path, 0, 0.0)
+    }
+
+    /// Opens `path` with the cursor at `cursor`, scrolled to line `top` (a restored session).
+    pub fn open_at(id: u64, path: PathBuf, cursor: usize, top: f64) -> Editor {
         let mut e = Editor::new(id);
-        e.start_load(path, None);
+        e.start_load(path, Some((cursor..cursor, top)));
         e
     }
 
+    /// A new, not yet saved tab holding `text` (a restored session).
+    pub fn untitled(id: u64, text: &[u8], cursor: usize, top: f64) -> Editor {
+        let mut e = Editor::new(id);
+        e.doc.insert(0, text);
+        e.modified = !text.is_empty();
+        e.cursor = cursor.min(text.len());
+        e.top = top;
+        e.pending_top = Some(top);
+        e
+    }
+
+    /// The file this tab shows, or is opening.
+    pub fn file(&self) -> Option<&PathBuf> {
+        self.loading.as_ref().map(|l| &l.path).or(self.path.as_ref())
+    }
+
+    /// Cursor and scroll line, including those still waiting for the file to open.
+    pub fn view(&self) -> (usize, f64) {
+        match &self.restore {
+            Some((sel, top)) if self.loading.is_some() => (sel.end, *top),
+            _ => (self.cursor, self.top),
+        }
+    }
+
     pub fn name(&self) -> String {
-        let p = self.loading.as_ref().map(|l| &l.path).or(self.path.as_ref());
-        p.and_then(|p| p.file_name()).map_or("untitled".into(), |n| n.to_string_lossy().into_owned())
+        if let Some(t) = &self.title {
+            return t.clone();
+        }
+        self.file().and_then(|p| p.file_name()).map_or("untitled".into(), |n| n.to_string_lossy().into_owned())
     }
 
     /// An empty untitled tab nobody has touched; opening a file reuses it.
     pub fn is_pristine(&self) -> bool {
-        self.path.is_none() && self.loading.is_none() && !self.modified && self.doc.len() == 0
+        self.path.is_none() && self.loading.is_none() && !self.modified && self.doc.len() == 0 && self.title.is_none()
     }
 
     fn start_load(&mut self, path: PathBuf, restore: Option<(Range<usize>, f64)>) {
@@ -296,10 +334,10 @@ impl Editor {
             self.msg = Some("Still opening the file; save again in a moment".into());
             return false;
         }
-        let path = match (&self.path, save_as) {
-            (Some(p), false) => p.clone(),
+        let (path, picked) = match (&self.path, save_as) {
+            (Some(p), false) => (p.clone(), false),
             _ => match self.save_dialog() {
-                Some(p) => p,
+                Some(p) => (p, true),
                 None => return false,
             },
         };
@@ -317,6 +355,10 @@ impl Editor {
         self.doc = Doc::new(); // release the mapping so Windows lets us replace the file
         match std::fs::rename(&tmp, &path) {
             Ok(()) => {
+                // The tab name was offered as the file name; from now on the tab shows the name chosen.
+                if picked {
+                    self.title = None;
+                }
                 self.start_load(path, restore);
                 self.msg = Some("Saved".into());
             }
@@ -360,6 +402,7 @@ impl Editor {
         self.typing = typing;
         self.redo.clear();
         self.modified = true;
+        self.edits += 1;
         self.goal_x = None;
         self.follow = true;
     }
@@ -399,6 +442,7 @@ impl Editor {
             self.anchor = None;
             self.typing = false;
             self.modified = true;
+            self.edits += 1;
             self.follow = true;
         }
     }
