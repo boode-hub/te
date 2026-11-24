@@ -11,6 +11,10 @@ use std::thread::JoinHandle;
 /// decimal parts fit either.
 pub const UNITS: &[(&str, f64)] = &[("bytes", 1.0), ("KB", 1e3), ("MB", 1e6), ("GB", 1e9)];
 
+/// More parts than this is surely a typo in the size (1 byte instead of 1 MB): refused, rather
+/// than flooding a folder with millions of files.
+pub const MAX_PARTS: usize = 10_000;
+
 /// How far back from a cut to look for a line end (a longer line is cut where the limit falls).
 const LOOKBACK: usize = 8 << 20;
 const WRITE_CHUNK: usize = 8 << 20;
@@ -34,6 +38,9 @@ pub fn estimate(len: usize, max: usize) -> usize {
 pub fn run(doc: &Doc, dir: &Path, name: &str, max: usize, at_lines: bool, done: &AtomicUsize, cancel: &AtomicBool) -> Result<Vec<PathBuf>, String> {
     let (len, max) = (doc.len(), max.max(1));
     let est = estimate(len, max);
+    if est > MAX_PARTS {
+        return Err(format!("that would be {est} files; the most is {MAX_PARTS}"));
+    }
     let mut written: Vec<PathBuf> = Vec::new();
     let result = (|| {
         let mut start = 0;
@@ -149,6 +156,16 @@ mod tests {
         let cancelled = run(&doc, &dir, "c.txt", 10, true, &done, &AtomicBool::new(true));
         assert_eq!(cancelled.unwrap_err(), "cancelled");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        // A part size that would make millions of files is refused before anything is written.
+        assert!(run(&doc, &dir, "x.txt", 1, false, &done, &never).is_ok()); // 70 parts is fine
+        let mut big = Doc::new();
+        big.insert(0, &vec![b'a'; MAX_PARTS + 1]);
+        assert!(run(&big, &dir, "y.txt", 1, false, &done, &never).unwrap_err().contains("the most is"));
+        assert!(!dir.join(part_name("y.txt", 1, MAX_PARTS + 1)).exists());
+        for f in std::fs::read_dir(&dir).unwrap().flatten() {
+            std::fs::remove_file(f.path()).unwrap();
+        }
 
         // A failure (folder gone) reports the error and also leaves nothing.
         let missing = dir.join("nope");

@@ -192,17 +192,21 @@ impl Doc {
     }
 
     /// Byte offset of the k-th (1-based) newline in orig.
+    ///
+    /// A mapped file can still be overwritten in place by another program (Windows blocks only
+    /// truncating it), so the bytes may no longer match the index built at load. Lookups here
+    /// then return a nearby position instead of panicking; File > Reload brings it back in step.
     fn orig_nth_nl(&self, k: usize) -> usize {
-        let c = self.index.partition_point(|&x| x < k) - 1;
+        let c = self.index.partition_point(|&x| x < k).saturating_sub(1);
         let start = c * CHUNK;
         let end = (start + CHUNK).min(self.orig().len());
-        start + memchr_iter(b'\n', &self.orig()[start..end]).nth(k - self.index[c] - 1).unwrap()
+        memchr_iter(b'\n', &self.orig()[start..end]).nth(k.saturating_sub(self.index[c] + 1)).map_or(end.saturating_sub(1), |i| start + i)
     }
 
     /// Newlines in the first `k` bytes of piece `p`.
     fn nl_in(&self, p: &Piece, k: usize) -> usize {
         match p.src {
-            Src::Orig => self.orig_nl_before(p.start + k) - p.base,
+            Src::Orig => self.orig_nl_before(p.start + k).saturating_sub(p.base).min(p.nl),
             Src::Add => count_nl(&self.add[p.start..p.start + k]),
         }
     }
@@ -227,6 +231,9 @@ impl Doc {
     }
 
     pub fn bytes(&self, r: Range<usize>) -> Vec<u8> {
+        if r.start >= r.end {
+            return Vec::new();
+        }
         let mut out = Vec::with_capacity(r.len().min(self.len.saturating_sub(r.start)));
         let first = self.piece_at(r.start);
         let mut pos = self.starts()[first].0;
@@ -256,10 +263,10 @@ impl Doc {
         let (pos, before) = self.starts()[i];
         let (p, rem) = (&self.pieces[i], n - before);
         let k = match p.src {
-            Src::Orig => self.orig_nth_nl(p.base + rem) - p.start,
-            Src::Add => memchr_iter(b'\n', self.slice(p)).nth(rem - 1).unwrap(),
+            Src::Orig => self.orig_nth_nl(p.base + rem).saturating_sub(p.start),
+            Src::Add => memchr_iter(b'\n', self.slice(p)).nth(rem - 1).unwrap_or(p.len.saturating_sub(1)),
         };
-        pos + k + 1
+        (pos + k.min(p.len.saturating_sub(1)) + 1).min(self.len)
     }
 
     /// End of line n, before its "\n" or "\r\n".
@@ -323,7 +330,7 @@ impl Doc {
                 let k = at - pos;
                 let nl = self.nl_in(&p, k);
                 self.pieces[i] = Piece { len: k, nl, ..p };
-                self.pieces.insert(i + 1, Piece { start: p.start + k, len: p.len - k, nl: p.nl - nl, base: p.base + nl, ..p });
+                self.pieces.insert(i + 1, Piece { start: p.start + k, len: p.len - k, nl: p.nl.saturating_sub(nl), base: p.base + nl, ..p });
                 return i + 1;
             }
             pos += p.len;
@@ -365,6 +372,30 @@ impl Doc {
             self.len -= p.len;
             self.nl -= p.nl;
         }
+    }
+
+    /// Bytes held by the typed-text buffer, including text no longer in the document (kept for undo).
+    pub fn add_len(&self) -> usize {
+        self.add.len()
+    }
+
+    /// Bytes of the typed-text buffer the document still shows.
+    pub fn add_live(&self) -> usize {
+        self.pieces.iter().filter(|p| p.src == Src::Add).map(|p| p.len).sum()
+    }
+
+    /// Rebuilds the typed-text buffer with only the bytes the document still shows, so text
+    /// replaced long ago stops taking memory. Undo snapshots made before this no longer fit it.
+    pub fn compact(&mut self) {
+        let mut add = Vec::with_capacity(self.add_live());
+        for i in 0..self.pieces.len() {
+            let p = self.pieces[i];
+            if p.src == Src::Add {
+                self.pieces[i].start = add.len();
+                add.extend_from_slice(&self.add[p.start..p.start + p.len]);
+            }
+        }
+        self.add = Arc::new(add);
     }
 
     pub fn snapshot(&self) -> Vec<Piece> {
@@ -572,6 +603,29 @@ mod tests {
         let b = a.clone();
         a.insert(3, b"d");
         assert_eq!((a.bytes(0..a.len()), b.bytes(0..b.len())), (b"abcd".to_vec(), b"abc".to_vec()));
+
+        // Compacting drops replaced text but keeps the document (and other snapshots) intact.
+        a.delete(0..4);
+        a.insert(0, b"xyz");
+        a.insert(1, b"--");
+        let before = (a.bytes(0..a.len()), a.line_count());
+        a.compact();
+        assert_eq!((a.bytes(0..a.len()), a.line_count(), a.add_len()), (before.0, before.1, 5));
+        assert_eq!(b.bytes(0..b.len()), b"abc");
+
+        // Reversed or empty ranges read as nothing instead of panicking.
+        let (hi, lo) = (3, 1);
+        assert!(a.bytes(hi..lo).is_empty() && a.bytes(9..20).is_empty());
+
+        // A mapped file overwritten in place by another program: lookups stay in bounds.
+        let mut stale = Doc::from_map(Orig::Mem(b"a\nb\nc\n".to_vec()), vec![0, 3]);
+        stale.orig = Some(Arc::new(Orig::Mem(b"abcdef".to_vec()))); // newlines gone, index says 3
+        for n in 0..5 {
+            assert!(stale.line_start(n) <= stale.len() && stale.line_end(n) <= stale.len());
+        }
+        let _ = (stale.line_of(4), stale.bytes(0..6));
+        stale.insert(3, b"x");
+        stale.delete(1..2);
         let _ = std::fs::remove_file(&path);
     }
 

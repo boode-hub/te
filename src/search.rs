@@ -108,7 +108,8 @@ fn search_doc(doc: &Doc, re: &Regex, hits: &AtomicUsize, cancel: &AtomicBool) ->
         let (ls, le) = (doc.line_start(line), doc.line_end(line));
         let a = ls.max(r.start.saturating_sub(PREVIEW_BEFORE));
         let m = r.end.min(le).max(r.start);
-        let z = le.min(m + PREVIEW_AFTER);
+        // A match can start on the '\n' of a "\r\n", past where line_end stops: never read backwards.
+        let z = le.min(m + PREVIEW_AFTER).max(m);
         let pre = lossy(&doc.bytes(a..r.start));
         out.push(Hit {
             range: r.clone(),
@@ -207,6 +208,12 @@ mod tests {
         assert!(q("cat", true, true, false).is_match(b"a cat.") && !q("cat", true, true, false).is_match(b"concat"));
         assert!(q(r"\d{3}", true, false, true).is_match(b"x123"));
         assert!(Query { text: "(".into(), regex: true, ..Default::default() }.build().is_err());
+
+        // Matches on the "\n" of a CRLF line end (\s, \n) used to read a backwards range and panic.
+        let mut crlf = Doc::new();
+        crlf.insert(0, b"one two\r\nthree\r\n");
+        let hits = search_doc(&crlf, &q(r"\s", true, false, true), &AtomicUsize::new(0), &AtomicBool::new(false));
+        assert_eq!(hits.iter().map(|h| h.range.start).collect::<Vec<_>>(), [3, 7, 8, 14, 15]);
 
         let dir = std::env::temp_dir().join("te_search_test");
         let _ = std::fs::remove_dir_all(&dir);

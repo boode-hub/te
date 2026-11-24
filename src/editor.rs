@@ -21,6 +21,9 @@ const FIND_IN_BACKGROUND: usize = 16 << 20;
 const FIND_SLICE: usize = 64 << 20;
 /// Whole-document tools (format, replace all, line ops) need the text in memory; cap it.
 pub const TRANSFORM_LIMIT: usize = 256 << 20;
+/// Replaced text stays in memory while undo can bring it back. Once the typed-text buffer is
+/// bigger than this and mostly replaced text, undo history is dropped to free it.
+const COMPACT_AT: usize = 512 << 20;
 
 /// Every colour the user can map. `from_pair` derives a whole theme from background + text.
 #[derive(Clone, Copy, PartialEq)]
@@ -420,6 +423,22 @@ impl Editor {
         self.anchor = None;
         self.doc.insert(self.cursor, text);
         self.cursor += text.len();
+        self.trim_memory();
+    }
+
+    /// Repeated big pastes, formats or replace-alls would otherwise pile up replaced text forever.
+    fn trim_memory(&mut self) {
+        let held = self.doc.add_len();
+        if held <= COMPACT_AT {
+            return;
+        }
+        let live = self.doc.add_live();
+        if live < held / 2 {
+            self.undo.clear();
+            self.redo.clear();
+            self.doc.compact();
+            self.msg = Some(format!("Freed {} MB of replaced text (undo history cleared)", (held - live) >> 20));
+        }
     }
 
     pub fn delete(&mut self, r: Range<usize>) {
@@ -510,7 +529,11 @@ impl Editor {
         let line = self.doc.line_of(self.cursor);
         let s = self.doc.line_start(line);
         let e = if line + 1 < self.doc.line_count() { self.doc.line_start(line + 1) } else { self.doc.len() };
-        let mut text = self.doc.bytes(s..e.min(s + TRANSFORM_LIMIT));
+        if e.saturating_sub(s) > TRANSFORM_LIMIT {
+            self.msg = Some("Duplicate line: that line is over 256 MB".into());
+            return;
+        }
+        let mut text = self.doc.bytes(s..e);
         if !text.ends_with(b"\n") {
             text.extend_from_slice(if self.doc.crlf { b"\r\n" } else { b"\n" });
         }
@@ -561,6 +584,7 @@ impl Editor {
                 self.anchor = Some(r.start);
                 self.cursor = r.start + out.len();
                 self.msg = Some(name.to_string());
+                self.trim_memory();
             }
             Err(e) => self.msg = Some(format!("{name}: {e}")),
         }
@@ -576,11 +600,15 @@ impl Editor {
     }
 
     pub fn set_line_endings(&mut self, crlf: bool) {
+        // transform_range refuses these (and says why); the style must then stay as it is.
+        let will_run = self.loading.is_none() && self.doc.len() <= TRANSFORM_LIMIT;
         self.transform_range(0..self.doc.len(), if crlf { "Line endings: CRLF" } else { "Line endings: LF" }, |b| {
             let lf = regex::bytes::Regex::new("\r\n").unwrap().replace_all(b, NoExpand(b"\n")).into_owned();
             Ok(if crlf { regex::bytes::Regex::new("\n").unwrap().replace_all(&lf, NoExpand(b"\r\n")).into_owned() } else { lf })
         });
-        self.doc.crlf = crlf;
+        if will_run {
+            self.doc.crlf = crlf;
+        }
     }
 
     // ---------- find / replace ----------
@@ -679,7 +707,7 @@ impl Editor {
 
     fn x_of(&self, ctx: &egui::Context, font: &FontId, pos: usize) -> f32 {
         let (s, b) = self.line_bytes(self.doc.line_of(pos));
-        width(ctx, font, &b[..(pos - s).min(b.len())])
+        width(ctx, font, &b[..pos.saturating_sub(s).min(b.len())])
     }
 
     fn pos_at_x(&self, ctx: &egui::Context, font: &FontId, line: usize, x: f32) -> usize {
@@ -922,7 +950,7 @@ impl Editor {
             }
             text.galley(pos2(x0, y + pad), ctx.fonts_mut(|f| f.layout_no_wrap(display(&b), font.clone(), fg)), fg);
             if n == cur_line {
-                let cx = x0 + width(&ctx, font, &b[..(self.cursor - s).min(b.len())]);
+                let cx = x0 + width(&ctx, font, &b[..self.cursor.saturating_sub(s).min(b.len())]);
                 let c = if active { t.cursor } else { t.cursor.gamma_multiply(0.35) };
                 text.rect_filled(Rect::from_min_size(pos2(cx - 1.0, y), vec2(2.0, line_h)), 1.0, c);
             }

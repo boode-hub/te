@@ -525,6 +525,8 @@ fn markup_tokens(s: &str, html: bool) -> Vec<Tok<'_>> {
     out
 }
 
+const MAX_INDENT: usize = 32;
+
 fn markup(b: &[u8], html: bool, pretty: bool) -> Result<Vec<u8>, String> {
     let t = markup_tokens(text(b)?, html);
     let mut out = String::with_capacity(b.len() + b.len() / 4);
@@ -534,7 +536,9 @@ fn markup(b: &[u8], html: bool, pretty: bool) -> Result<Vec<u8>, String> {
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str(&"    ".repeat(depth));
+            // Unclosed tags (<p>, <li> in HTML) keep deepening; past this, lines stop moving right,
+            // or a page with thousands of them would grow to gigabytes of spaces.
+            out.push_str(&"    ".repeat(depth.min(MAX_INDENT)));
         }
         out.push_str(x);
     };
@@ -786,6 +790,9 @@ mod tests {
         assert_eq!(x, "<?xml version=\"1.0\"?>\n<a>\n    <b x=\"1>2\">t</b>\n    <c/>\n    <d>\n        <e>1</e>\n    </d>\n    <!-- n -->\n</a>\n");
         let h = run(|b| markup(b, true, true), "<div><br><img src=a><script>if (a<b) x();</script></div>");
         assert_eq!(h, "<div>\n    <br>\n    <img src=a>\n    <script>\n        if (a<b) x();\n    </script>\n</div>\n");
+        // 20,000 unclosed <li>: indentation stops at MAX_INDENT instead of growing to gigabytes.
+        let deep = markup("<li>x".repeat(20_000).as_bytes(), true, true).unwrap();
+        assert!(deep.len() < 40_000 * (MAX_INDENT * 4 + 8), "{} bytes", deep.len());
 
         assert_eq!(run(csv_to_json, "a,b\n1,\"x,\"\"y\"\n"), "[\n    {\n        \"a\": \"1\",\n        \"b\": \"x,\\\"y\"\n    }\n]\n");
         assert_eq!(run(LINES[2].1, "b\r\na\r\nb\r\n"), "b\r\na\r\n");

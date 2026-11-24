@@ -107,9 +107,11 @@ impl Settings {
             match k {
                 "font" => self.font = v.into(),
                 "font_path" => self.font_path = v.into(),
-                "size" => self.size = v.parse().unwrap_or(self.size),
+                // Profiles are shared files: a size of 100000 would build a giant font atlas, and
+                // a spacing of 0 makes every line 0 points tall. Keep the sliders' ranges.
+                "size" => self.size = in_range(v, 6.0, 96.0).unwrap_or(self.size),
                 "gutter" => self.gutter = v == "1",
-                "spacing" => self.spacing = v.parse().unwrap_or(self.spacing),
+                "spacing" => self.spacing = in_range(v, 1.0, 2.5).unwrap_or(self.spacing),
                 "recent" if recent.len() < RECENT_MAX => recent.push(v.to_string()),
                 "custom" => {
                     for (slot, hex) in self.custom.iter_mut().zip(v.split(',')) {
@@ -157,6 +159,43 @@ impl Settings {
         }
         out
     }
+}
+
+/// Only the first te window keeps the session (two would delete each other's unsaved-tab text);
+/// it holds `session\lock` open, unshared, until it exits. Windows opened meanwhile (a file
+/// double-clicked in Explorer) leave the session alone. None: another window owns it, or the
+/// folder can't be written (te then asks about unsaved new tabs on close, as before).
+fn lock_session(dir: &Path) -> Option<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::create_dir_all(dir).ok()?;
+    std::fs::OpenOptions::new().write(true).create(true).truncate(false).share_mode(0).open(dir.join("lock")).ok()
+}
+
+/// Writes the session: each new tab's text, then the tab list, then removes text files of tabs
+/// closed or saved since. Each file is written beside its old copy and then swapped in, so a
+/// crash mid-write never leaves a half-written one.
+fn write_session(dir: &Path, files: &[(String, doc::Doc)], json: &str, keep: &[String]) -> std::io::Result<()> {
+    let write = |name: &str, f: &dyn Fn(&Path) -> std::io::Result<()>| {
+        let tmp = dir.join(format!("{name}.tmp"));
+        f(&tmp).and_then(|()| std::fs::rename(&tmp, dir.join(name)))
+    };
+    std::fs::create_dir_all(dir)?;
+    for (name, doc) in files {
+        write(name, &|p| doc.write_to(p))?;
+    }
+    write("tabs.json", &|p| std::fs::write(p, json))?;
+    for f in std::fs::read_dir(dir)?.flatten() {
+        let n = f.file_name().to_string_lossy().into_owned();
+        if n.ends_with(".txt") && !keep.contains(&n) {
+            let _ = std::fs::remove_file(f.path());
+        }
+    }
+    Ok(())
+}
+
+/// `v` as a number clamped to `lo..=hi`; None if it isn't a finite number.
+fn in_range(v: &str, lo: f32, hi: f32) -> Option<f32> {
+    v.trim().parse::<f32>().ok().filter(|x| x.is_finite()).map(|x| x.clamp(lo, hi))
 }
 
 /// Saved appearance profiles, one `<name>.cfg` each, next to the exe.
@@ -406,6 +445,8 @@ fn pane_name(n: usize, p: usize) -> &'static str {
     }
 }
 
+type SessionJob = (std::thread::JoinHandle<std::io::Result<()>>, String, Vec<(u64, u64)>);
+
 #[derive(PartialEq, Clone, Copy)]
 enum Scope {
     File,
@@ -456,8 +497,9 @@ struct App {
     /// Last frame's pane rectangles, to find which pane a file was dropped on.
     pane_rects: Vec<Rect>,
     look_tab: usize,
-    /// Each split pane's own quick search text.
+    /// Each split pane's own quick search text, and the regex last built from it.
     pane_find: Vec<String>,
+    pane_re: Vec<(String, Option<regex::bytes::Regex>)>,
     profiles: Option<Vec<String>>,
     profile_name: String,
     status: String,
@@ -469,6 +511,11 @@ struct App {
     session_at: std::time::Instant,
     /// Edit count of each new tab's text as last written to the session folder.
     backed_up: HashMap<u64, u64>,
+    /// A session write in progress: its thread, the tab list it writes, and (tab id, edit count)
+    /// of each text it backs up.
+    session_job: Option<SessionJob>,
+    /// Held open while this window owns the session folder.
+    _session_lock: Option<std::fs::File>,
     /// The tab being renamed: its id, the name typed so far, and whether to focus the box.
     renaming: Option<(u64, String, bool)>,
 }
@@ -477,8 +524,12 @@ impl App {
     fn new(cc: &eframe::CreationContext) -> App {
         updater::clean_up_after_update();
         let mut app = App::with_ctx(&cc.egui_ctx);
-        app.session = Some(std::env::current_exe().unwrap_or_default().with_file_name("session"));
-        app.restore_session();
+        let dir = std::env::current_exe().unwrap_or_default().with_file_name("session");
+        if let Some(lock) = lock_session(&dir) {
+            app._session_lock = Some(lock);
+            app.session = Some(dir);
+            app.restore_session();
+        }
         for p in std::env::args_os().skip(1) {
             let p = PathBuf::from(p);
             if p.is_dir() { app.set_folder(p) } else { app.open_path(p) }
@@ -534,6 +585,7 @@ impl App {
             pane_rects: Vec::new(),
             look_tab: 0,
             pane_find: Vec::new(),
+            pane_re: Vec::new(),
             profiles: None,
             profile_name: String::new(),
             status: String::new(),
@@ -543,6 +595,8 @@ impl App {
             session_saved: String::new(),
             session_at: std::time::Instant::now(),
             backed_up: HashMap::new(),
+            session_job: None,
+            _session_lock: None,
             renaming: None,
         }
     }
@@ -593,6 +647,9 @@ impl App {
         }
         let id = self.tabs.remove(i).id;
         self.views.retain(|(_, t), _| *t != id);
+        if self.renaming.as_ref().is_some_and(|r| r.0 == id) {
+            self.renaming = None;
+        }
         let showed: Vec<usize> = (0..self.panes.len()).filter(|&p| self.panes[p] == i).collect();
         for p in &mut self.panes {
             if *p > i {
@@ -688,9 +745,22 @@ impl App {
     }
 
     /// Remembers the open tabs in `session\tabs.json`, and the text of new tabs not saved yet as
-    /// `session\<id>.txt`, so te reopens as it was left. At most every 2 seconds; `now` at exit.
-    fn save_session(&mut self, ctx: &egui::Context, now: bool) {
-        let Some(dir) = self.session.clone() else { return };
+    /// `session\<id>.txt`, so te reopens as it was left. At most every 2 seconds, written on a
+    /// thread of its own (a big unsaved tab must not stall typing); `now` (at exit) writes at
+    /// once. Returns true when the session on disk holds the open tabs as they are.
+    fn save_session(&mut self, ctx: &egui::Context, now: bool) -> bool {
+        let Some(dir) = self.session.clone() else { return false };
+        if let Some((job, ..)) = &self.session_job
+            && !now
+            && !job.is_finished()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return false;
+        }
+        if let Some((job, json, done)) = self.session_job.take() {
+            let result = job.join().unwrap_or_else(|_| Err(std::io::Error::other("the writer crashed")));
+            self.session_written(result, json, done);
+        }
         let (mut tabs, mut index, mut backups) = (Vec::new(), vec![None; self.tabs.len()], Vec::new());
         for (i, e) in self.tabs.iter().enumerate() {
             let (cursor, top) = e.view();
@@ -711,45 +781,41 @@ impl App {
         let panes: Vec<usize> = self.panes.iter().filter_map(|&p| index[p]).collect();
         let json = serde_json::json!({ "tabs": tabs, "panes": panes, "active": self.active, "splits": self.splits, "split_y": self.split_y }).to_string();
         if json == self.session_saved && backups.is_empty() {
-            return;
+            return true;
         }
         let wait = std::time::Duration::from_secs(2).saturating_sub(self.session_at.elapsed());
         if !now && !wait.is_zero() {
             ctx.request_repaint_after(wait);
-            return;
+            return false;
         }
         self.session_at = std::time::Instant::now();
-        // Each file is written beside its old copy and then swapped in, so a crash mid-write
-        // never leaves a half-written one.
-        let write = |name: &str, f: &dyn Fn(&Path) -> std::io::Result<()>| {
-            let tmp = dir.join(format!("{name}.tmp"));
-            f(&tmp).and_then(|()| std::fs::rename(&tmp, dir.join(name)))
-        };
-        // ponytail: written on the UI thread; move to a thread if huge unsaved tabs make typing stutter.
-        let result = std::fs::create_dir_all(&dir).and_then(|()| {
-            for &i in &backups {
-                let e = &self.tabs[i];
-                write(&format!("{}.txt", e.id), &|p| e.doc.write_to(p))?;
-            }
-            write("tabs.json", &|p| std::fs::write(p, &json))?;
-            // Text of tabs closed or saved to a file since.
-            let keep: Vec<String> = self.tabs.iter().filter(|e| e.file().is_none()).map(|e| format!("{}.txt", e.id)).collect();
-            for f in std::fs::read_dir(&dir)?.flatten() {
-                let n = f.file_name().to_string_lossy().into_owned();
-                if n.ends_with(".txt") && !keep.contains(&n) {
-                    let _ = std::fs::remove_file(f.path());
-                }
-            }
-            Ok(())
-        });
+        // Snapshots are cheap (shared buffers), so the writer works on its own copy.
+        let files: Vec<(String, doc::Doc)> = backups.iter().map(|&i| (format!("{}.txt", self.tabs[i].id), self.tabs[i].doc.clone())).collect();
+        let done: Vec<(u64, u64)> = backups.iter().map(|&i| (self.tabs[i].id, self.tabs[i].edits)).collect();
+        let keep: Vec<String> = self.tabs.iter().filter(|e| e.file().is_none()).map(|e| format!("{}.txt", e.id)).collect();
+        let text = json.clone();
+        let write = move || write_session(&dir, &files, &text, &keep);
+        if now {
+            return self.session_written(write(), json, done);
+        }
+        self.session_job = Some((std::thread::spawn(write), json, done));
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        false
+    }
+
+    /// Takes in a finished session write. Returns whether it worked.
+    fn session_written(&mut self, result: std::io::Result<()>, json: String, done: Vec<(u64, u64)>) -> bool {
         match result {
             Ok(()) => {
-                for &i in &backups {
-                    self.backed_up.insert(self.tabs[i].id, self.tabs[i].edits);
-                }
+                self.backed_up.extend(done);
                 self.session_saved = json;
+                true
             }
-            Err(e) => self.status = format!("Couldn't remember the open tabs in {}: {e}", dir.display()),
+            Err(e) => {
+                let dir = self.session.as_deref().unwrap_or(Path::new("session"));
+                self.status = format!("Couldn't remember the open tabs in {}: {e}", dir.display());
+                false
+            }
         }
     }
 
@@ -797,6 +863,43 @@ impl App {
         self.splits = if splits.len() == equal_splits(n).len() { splits } else { equal_splits(n) };
         self.split_y = v["split_y"].as_f64().map_or(0.5, |y| (y as f32).clamp(0.05, 0.95));
         self.active = (v["active"].as_u64().unwrap_or(0) as usize).min(n - 1);
+    }
+
+    /// The window is closing: nothing unsaved may be lost on the way out.
+    fn close_requested(&mut self, ctx: &egui::Context) {
+        let cancel = || ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        // A split still holds the file open (so saving it can't replace it), and stopping one
+        // throws its parts away: ask first.
+        if let Some(job) = self.split_job.take() {
+            let stop = !dialogs()
+                || rfd::MessageDialog::new()
+                    .set_title("te")
+                    .set_description("A split into parts is still running. Stop it (its parts are deleted) and close te?")
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    == rfd::MessageDialogResult::Yes;
+            if !stop {
+                self.split_job = Some(job);
+                return cancel();
+            }
+            job.cancel();
+            let _ = job.join(); // deletes the parts it wrote
+        }
+        self.stop_search(); // a search may map a file that saving below must replace
+        // New tabs not saved yet come back with the session, if it could be written; edited
+        // files are always asked about.
+        let kept = self.save_session(ctx, true);
+        for i in 0..self.tabs.len() {
+            if self.tabs[i].modified && (self.tabs[i].file().is_some() || !kept) {
+                self.show_tab(i);
+                if !self.tabs[i].confirm_discard() {
+                    return cancel();
+                }
+            }
+        }
+        if kept {
+            self.save_session(ctx, true); // files just saved or reopened
+        }
     }
 
     fn add_recent(&mut self, p: &Path) {
@@ -1650,7 +1753,9 @@ impl App {
                 pick_dir = ui.small_button("Change…").clicked();
             });
             let est = split::estimate(len, max);
-            if len > 0 {
+            if est > split::MAX_PARTS {
+                ui.colored_label(Color32::from_rgb(0xff, 0x6b, 0x6b), format!("That would be {est} files; the most is {}. Choose a bigger size.", split::MAX_PARTS));
+            } else if len > 0 {
                 let names = if est > 1 { format!("{} … {}", split::part_name(&name, 1, est), split::part_name(&name, est, est)) } else { split::part_name(&name, 1, est) };
                 ui.label(format!("About {est} file{}: {names}", if est == 1 { "" } else { "s" }));
             } else {
@@ -1664,7 +1769,7 @@ impl App {
                     }
                 });
             }
-            go = ui.add_enabled(len > 0 && dir.is_some(), egui::Button::new("Split")).clicked();
+            go = ui.add_enabled(len > 0 && dir.is_some() && est <= split::MAX_PARTS, egui::Button::new("Split")).clicked();
         });
         self.split_open = open;
         if pick_dir && dialogs() && let Some(d) = rfd::FileDialog::new().pick_folder() {
@@ -1727,6 +1832,7 @@ impl App {
         let font = FontId::new(self.s.size, FontFamily::Name("user".into()));
         let n = self.panes.len();
         self.pane_find.resize(n, String::new());
+        self.pane_re.resize(n, (String::new(), None));
         let area = ui.max_rect();
         if self.splits.len() != equal_splits(n).len() {
             self.splits = equal_splits(n);
@@ -1744,8 +1850,12 @@ impl App {
             if n > 1 && self.pane_header(&mut child, p, tab) {
                 self.active = p;
             }
-            // A pane's own quick search wins over the main find bar's highlight.
-            let pane_re = Query { text: self.pane_find[p].clone(), ..Default::default() }.build().ok();
+            // A pane's own quick search wins over the main find bar's highlight. Compiled only
+            // when its text changes, not every frame.
+            if self.pane_re[p].0 != self.pane_find[p] {
+                self.pane_re[p] = (self.pane_find[p].clone(), Query { text: self.pane_find[p].clone(), ..Default::default() }.build().ok());
+            }
+            let pane_re = self.pane_re[p].1.clone();
             let view = View { font: font.clone(), theme, gutter: self.s.gutter, spacing: self.s.spacing, highlight: pane_re.as_ref().or(hl.as_ref()) };
             let ed = &mut self.tabs[tab];
             let vs = self.views.entry((p, ed.id)).or_insert(PaneView { top: ed.top, scroll_x: ed.scroll_x });
@@ -2133,22 +2243,7 @@ impl App {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.stop_search();
-            if let Some(job) = self.split_job.take() {
-                job.cancel();
-                let _ = job.join(); // deletes the parts it wrote
-            }
-            // New tabs not saved yet come back with the session; edited files are asked about.
-            for i in 0..self.tabs.len() {
-                if self.tabs[i].modified && (self.tabs[i].file().is_some() || self.session.is_none()) {
-                    self.show_tab(i);
-                    if !self.tabs[i].confirm_discard() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                        break;
-                    }
-                }
-            }
-            self.save_session(&ctx, true);
+            self.close_requested(&ctx);
         }
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>());
         if !dropped.is_empty()
@@ -2232,12 +2327,16 @@ fn log_panics() {
             let msg = payload.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_default();
             let at = info.location().map_or(String::new(), |l| format!("{}:{}", l.file(), l.line()));
             let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-            let line = format!("[unix {secs}] te {} panicked at {at}: {msg}\n", env!("CARGO_PKG_VERSION"));
-            let path = std::env::current_exe().unwrap_or_default().with_file_name("te-crash.log");
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+            crash_log(&format!("[unix {secs}] te {} panicked at {at}: {msg}", env!("CARGO_PKG_VERSION")));
         }
         default_hook(info);
     }));
+}
+
+/// Appends one line to te-crash.log next to te.exe.
+fn crash_log(line: &str) {
+    let path = std::env::current_exe().unwrap_or_default().with_file_name("te-crash.log");
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()));
 }
 
 /// Opens a web page in the default browser.
@@ -2302,12 +2401,13 @@ fn self_test() -> Result<(), String> {
 
 /// Command-line modes that run without a window. Returns the exit code, or None to start the GUI.
 fn command_line() -> Option<i32> {
-    let arg = std::env::args().nth(1)?;
+    // args() would panic on a file name that isn't valid Unicode (possible on Windows).
+    let arg = std::env::args_os().nth(1)?;
     let say = |line: String| {
         use std::io::Write;
         let _ = writeln!(std::io::stdout(), "{line}");
     };
-    match arg.as_str() {
+    match arg.to_str()? {
         "--self-test" => Some(match self_test() {
             Ok(()) => {
                 say(format!("te {} self-test ok", env!("CARGO_PKG_VERSION")));
@@ -2357,6 +2457,9 @@ fn main() -> eframe::Result {
     if let Some(code) = command_line() {
         std::process::exit(code);
     }
+    // Set on the second try, after DirectX 12 could not open the window.
+    const FALLBACK: &str = "TE_RENDER_FALLBACK";
+    let fallback = std::env::var_os(FALLBACK).is_some();
     let icon = egui::IconData { rgba: LOGO.to_vec(), width: 128, height: 128 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -2369,10 +2472,10 @@ fn main() -> eframe::Result {
         wgpu_options: egui_wgpu::WgpuConfiguration {
             wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(egui_wgpu::WgpuSetupCreateNew {
                 instance_descriptor: egui_wgpu::wgpu::InstanceDescriptor {
-                    backends: egui_wgpu::wgpu::Backends::DX12,
+                    backends: if fallback { egui_wgpu::wgpu::Backends::all() } else { egui_wgpu::wgpu::Backends::DX12 },
                     ..egui_wgpu::WgpuSetupCreateNew::without_display_handle().instance_descriptor
                 },
-                power_preference: egui_wgpu::wgpu::PowerPreference::LowPower,
+                power_preference: if fallback { egui_wgpu::wgpu::PowerPreference::None } else { egui_wgpu::wgpu::PowerPreference::LowPower },
                 // A text editor needs little GPU memory: don't reserve big blocks up front.
                 device_descriptor: Arc::new(|_| egui_wgpu::wgpu::DeviceDescriptor {
                     label: Some("te"),
@@ -2386,7 +2489,24 @@ fn main() -> eframe::Result {
         },
         ..Default::default()
     };
-    eframe::run_native("te", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    let result = eframe::run_native("te", options, Box::new(|cc| Ok(Box::new(App::new(cc)))));
+    // Without this, a graphics failure is a window that silently never appears.
+    if let Err(e) = &result {
+        crash_log(&format!("te {} could not open its window ({}): {e}", env!("CARGO_PKG_VERSION"), if fallback { "any graphics backend" } else { "DirectX 12" }));
+        // A process can start its window system only once, so the retry is a fresh te.
+        if !fallback
+            && let Ok(exe) = std::env::current_exe()
+            && std::process::Command::new(exe).args(std::env::args_os().skip(1)).env(FALLBACK, "1").spawn().is_ok()
+        {
+            return Ok(());
+        }
+        rfd::MessageDialog::new()
+            .set_title("te")
+            .set_level(rfd::MessageLevel::Error)
+            .set_description(format!("te could not open its window: {e}\n\nDetails are in te-crash.log next to te.exe."))
+            .show();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2422,8 +2542,9 @@ mod tests {
         a.new_tab(); // tab 2: empty and unnamed, not worth keeping
         a.set_layout(2);
         a.panes = vec![1, 0];
-        a.save_session(&ctx, true);
+        assert!(a.save_session(&ctx, true));
         assert!(session.join(format!("{}.txt", a.tabs[0].id)).is_file());
+        assert!(a.save_session(&ctx, true), "nothing changed: still kept");
 
         let mut b = App::with_ctx(&ctx);
         b.session = Some(session.clone());
@@ -2443,6 +2564,27 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(&session).unwrap().flatten().map(|f| f.file_name()).collect();
         assert_eq!(left, ["tabs.json"]);
 
+        // Only one window owns the session; a second one leaves it alone.
+        let lock = lock_session(&session).unwrap();
+        assert!(lock_session(&session).is_none());
+        drop(lock);
+        assert!(lock_session(&session).is_some());
+
+        // A session folder that can't be written reports it, so closing asks about new tabs.
+        let mut c = App::with_ctx(&ctx);
+        c.session = Some(file.clone()); // a file, not a folder
+        c.ed().insert(b"unsaved", false);
+        assert!(!c.save_session(&ctx, true));
+        assert!(c.status.contains("Couldn't remember"));
+
+        // The background writer: a periodic save hands off to a thread and is taken in later.
+        b.tabs[0].path = None;
+        b.tabs[0].insert(b" more", false);
+        b.session_at = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        assert!(!b.save_session(&ctx, false) && b.session_job.is_some());
+        assert!(b.save_session(&ctx, true)); // waits for it
+        assert!(b.session_job.is_none() && session.join(format!("{}.txt", b.tabs[0].id)).is_file());
+
         // A renamed tab offers its name to Save As; clearing the name follows the file again.
         let mut e = Editor::new(9);
         assert_eq!(e.name(), "untitled");
@@ -2458,6 +2600,12 @@ mod tests {
         s.apply("bg=#102030ff\nfg=#e0e0e0ff\nsize=18\nrecent=C:/a.txt\n");
         let (bg, fg) = (Color32::from_hex("#102030ff").unwrap(), Color32::from_hex("#e0e0e0ff").unwrap());
         assert!(s.t == Theme::from_pair(bg, fg) && s.size == 18.0 && s.recent == ["C:/a.txt"]);
+        // Out-of-range or garbage numbers from a hand-edited file or a shared profile are tamed.
+        let mut wild = Settings::default();
+        wild.apply("size=100000\nspacing=0\n");
+        assert_eq!((wild.size, wild.spacing), (96.0, 1.0));
+        wild.apply("size=NaN\nspacing=inf\n");
+        assert_eq!((wild.size, wild.spacing), (96.0, 1.0));
 
         // A profile round-trips every colour, but leaves recent files alone.
         s.t.cursor = Color32::from_rgb(255, 0, 0);

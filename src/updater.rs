@@ -54,9 +54,18 @@ impl Updater {
 
     /// Downloads, verifies and installs `release` next to the running program.
     pub fn install(&self, ctx: &Context, release: Release) {
+        let v = release.version;
+        {
+            // Claimed before the thread starts, so a second click can't start a second install
+            // racing this one over te.new.exe / te.old.exe.
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(*state, State::Available(_)) {
+                return;
+            }
+            *state = State::Downloading { version: v, done: 0, total: 0 };
+        }
         let (me, ctx) = (self.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let v = release.version;
             let result = (|| {
                 let exe = current_exe()?;
                 let agent = agent();
